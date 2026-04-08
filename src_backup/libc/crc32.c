@@ -1,0 +1,29 @@
+#include "libc/crc32.h"
+
+static uint32_t g_table[256];
+static int g_table_init = 0;
+
+static void crc32_init_table(void) {
+    for (uint32_t i = 0; i < 256; i++) {
+        uint32_t c = i;
+        for (int j = 0; j < 8; j++) {
+            if (c & 1u) c = 0xEDB88320u ^ (c >> 1);
+            else        c = (c >> 1);
+        }
+        g_table[i] = c;
+    }
+    g_table_init = 1;
+}
+
+uint32_t crc32_ieee(const void* data, size_t len) {
+    if (!g_table_init) crc32_init_table();
+
+    uint32_t crc = 0xFFFFFFFFu;
+    const uint8_t* p = (const uint8_t*)data;
+
+    for (size_t i = 0; i < len; i++) {
+        crc = g_table[(crc ^ p[i]) & 0xFFu] ^ (crc >> 8);
+    }
+
+    return crc ^ 0xFFFFFFFFu;
+}

@@ -2,7 +2,7 @@
 set -e
 
 WIN_IMAGE=$(wslpath -w "$(readlink -f kiwiOS.iso)")
-WIN_DISK=$(wslpath -w "$(readlink -f disk.img)")
+WIN_DISK=$(wslpath -w "$(readlink -f disk_gpt.img)")
 
 cd "/mnt/c/Program Files/qemu/"
 
@@ -12,5 +12,6 @@ cd "/mnt/c/Program Files/qemu/"
   -device ich9-ahci,id=ahci0 \
   -drive id=d0,file="$WIN_DISK",if=none,format=raw \
   -device ide-hd,drive=d0,bus=ahci0.0 \
+  -m 2048M \
   -cdrom "$WIN_IMAGE" \
   -boot order=d

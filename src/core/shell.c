@@ -12,6 +12,9 @@
 #include "memory/vmm.h"
 #include "memory/hhdm.h"
 #include "fs/bcache.h"
+#include "vfs/vfs.h"
+#include "fs/kifs/kifs.h"
+#include "fs/kifs/kifs_disk.h"
 
 static void print_byte_hex(struct limine_framebuffer *fb, uint8_t b) {
     static const char* hex = "0123456789ABCDEF";
@@ -62,32 +65,17 @@ static const char* skip_token(const char* s) {
 
 // ================= Command functions =================
 static void cmd_help(struct limine_framebuffer *fb) {
-    print(fb, "Available commands:\n\n");
-    print(fb, "  help       - Show this help message\n");
-    print(fb, "  clear      - Clear the console\n");
-    print(fb, "  echo [msg] - Print a message\n");
-    print(fb, "  about      - Show information about KiwiOS\n");
-    print(fb, "  crash [n]  - Trigger exception number n\n");
-    print(fb, "  meminfo    - Show memory usage information\n");
-    print(fb, "  memtest    - Run a memory test\n");
-    print(fb, "  vmtest     - Run a VMM test\n");
-    print(fb, "  heaptest   - Run a heap allocation test\n");
-    print(fb, "  fbinfo     - Show framebuffer details\n");
-    print(fb, "  scale [factor] - Set framebuffer scaling factor\n");
-    print(fb, "\n");
-    print(fb, "Disk commands:\n");
-    print(fb, "  rawread   <lba> [count]                 - Read boot disk sectors and hex-dump first 256 bytes\n");
-    print(fb, "  rawwrite  <lba> [count] <byte>          - Write pattern to boot disk then read back + verify\n");
-    print(fb, "  rawflush                                - Flush boot disk write cache\n");
-    print(fb, "  partlist                                - List partitions\n");
-    print(fb, "  diskreadp  <part> <lba> [count]         - Read from partition device\n");
-    print(fb, "  diskwritep <part> <lba> [count] <byte>  - Write to partition device and verify\n");
-    print(fb, "  diskflushp <part>                       - Flush through partition device\n");
-    print(fb, "  disktest                                - Quick test: write/read/verify at LBA 2048\n");
-    print(fb, "  bcachestat                              - Show block cache statistics\n");
-    print(fb, "  bcacheflush                             - Flush all dirty buffers\n");
-    print(fb, "  bcacheflushp <part>                     - Flush partition buffers\n");
+    print(fb, "Commands: help clear echo about crash meminfo memtest vmtest heaptest fbinfo scale partlist disktest mount kifs ls stat cat\n");
 }
+
+
+
+
+
+
+
+
+
 
 static void cmd_clear(struct limine_framebuffer *fb /*unused*/) {
     (void)fb;
@@ -510,12 +498,7 @@ static block_device_t* get_part(struct limine_framebuffer *fb, uint32_t idx) {
 // -------- Core disk ops (shared) --------
 
 static bool do_diskread(struct limine_framebuffer* fb, block_device_t* dev, uint64_t lba, uint32_t count) {
-    const uint32_t MAX_BYTES = 512u * 1024u; // sanity cap
     uint32_t bytes = count * dev->sector_size;
-    if (bytes > MAX_BYTES) {
-        print(fb, "diskread: request too large (cap = 512KiB). Reduce count.\n");
-        return false;
-    }
 
     size_t pages = (bytes + PAGE_SIZE - 1) / PAGE_SIZE;
     void* phys = pmm_alloc_pages(pages);
@@ -904,6 +887,338 @@ static void cmd_bcacheflushp(struct limine_framebuffer* fb, const char* args) {
     print(fb, "bcacheflushp: OK\n");
 }
 
+
+// -------- Filesystem (KiFS via VFS) --------
+
+static const char* trim_spaces(const char* s) {
+    if (!s) return s;
+    while (*s == ' ') s++;
+    return s;
+}
+
+static void cmd_mount(struct limine_framebuffer* fb, const char* args) {
+    args = trim_spaces(args);
+
+    bool ok = false;
+    if (args && *args) {
+        uint32_t idx = 0;
+        if (!parse_u32(args, &idx)) {
+            print(fb, "Usage: mount [part]\n");
+            return;
+        }
+        block_device_t* dev = block_partition_device(idx);
+        if (!dev) {
+            print(fb, "mount: invalid partition index\n");
+            return;
+        }
+        ok = vfs_mount_root_dev(dev);
+    } else {
+        ok = vfs_mount_root_auto();
+    }
+
+    if (!ok) {
+        print(fb, "mount: FAILED (see logs)\n");
+        return;
+    }
+
+    vfs_mount_t* m = vfs_root_mount();
+    if (!m) {
+        print(fb, "mount: FAILED (no mount)\n");
+        return;
+    }
+
+    print(fb, "mount: OK (fs=");
+    print(fb, m->fs_name ? m->fs_name : "?");
+    print(fb, ", dev=");
+    print(fb, m->dev && m->dev->name ? m->dev->name : "?");
+    print(fb, m->readonly ? ", ro)\n" : ", rw)\n");
+}
+
+static void cmd_mkfs_kifs(struct limine_framebuffer* fb, const char* args) {
+    args = trim_spaces(args);
+    uint32_t idx = 0;
+    if (!parse_u32(args, &idx)) {
+        print(fb, "Usage: mkfs.kifs <part> [inodes]\n");
+        return;
+    }
+    args = skip_token(args);
+
+    uint32_t inodes = 1024;
+    if (args && *args) {
+        parse_u32(args, &inodes);
+    }
+
+    block_device_t* dev = block_partition_device(idx);
+    if (!dev) {
+        print(fb, "mkfs.kifs: invalid partition index\n");
+        return;
+    }
+
+    print(fb, "mkfs.kifs: formatting (THIS DESTROYS ALL DATA)...\n");
+    if (!kifs_mkfs(dev, inodes)) {
+        print(fb, "mkfs.kifs: FAILED (see logs)\n");
+        return;
+    }
+    print(fb, "mkfs.kifs: OK\n");
+}
+
+static void cmd_kifsbmdump(struct limine_framebuffer* fb, const char* args) {
+    uint64_t nbits64 = 128;
+    if (args && *args) {
+        if (!parse_u64(args, &nbits64)) {
+            print(fb, "Usage: kifsbmdump [nbits]\n");
+            return;
+        }
+    }
+    if (nbits64 == 0 || nbits64 > 2048) {
+        print(fb, "kifsbmdump: nbits must be 1..2048\n");
+        return;
+    }
+    uint32_t nbits = (uint32_t)nbits64;
+
+    vfs_mount_t* m = vfs_root_mount();
+    if (!m) {
+        print(fb, "kifsbmdump: no root filesystem mounted\n");
+        return;
+    }
+    if (!m->fs_name || strcmp(m->fs_name, "kifs") != 0) {
+        print(fb, "kifsbmdump: root filesystem is not KiFS\n");
+        return;
+    }
+
+    uint8_t* blk_bits = (uint8_t*)kmalloc(nbits);
+    uint8_t* ino_bits = (uint8_t*)kmalloc(nbits);
+    if (!blk_bits || !ino_bits) {
+        if (blk_bits) kfree(blk_bits);
+        if (ino_bits) kfree(ino_bits);
+        print(fb, "kifsbmdump: out of memory\n");
+        return;
+    }
+
+    if (!kifs_debug_get_bitmap_bits(m, false, 0, nbits, blk_bits) ||
+        !kifs_debug_get_bitmap_bits(m, true, 0, nbits, ino_bits)) {
+        kfree(blk_bits);
+        kfree(ino_bits);
+        print(fb, "kifsbmdump: failed to read/validate bitmap blocks\n");
+        return;
+    }
+
+    print(fb, "Block bitmap (first bits):\n");
+    for (uint32_t i = 0; i < nbits; i++) {
+        putc_fb(fb, blk_bits[i] ? '1' : '0');
+        if ((i % 64u) == 63u) putc_fb(fb, '\n');
+        else if ((i % 8u) == 7u) putc_fb(fb, ' ');
+    }
+    if ((nbits % 64u) != 0) putc_fb(fb, '\n');
+
+    print(fb, "Inode bitmap (first bits):\n");
+    for (uint32_t i = 0; i < nbits; i++) {
+        putc_fb(fb, ino_bits[i] ? '1' : '0');
+        if ((i % 64u) == 63u) putc_fb(fb, '\n');
+        else if ((i % 8u) == 7u) putc_fb(fb, ' ');
+    }
+    if ((nbits % 64u) != 0) putc_fb(fb, '\n');
+
+    kfree(blk_bits);
+    kfree(ino_bits);
+}
+
+static void cmd_kifs_sb(struct limine_framebuffer* fb) {
+    vfs_mount_t* m = vfs_root_mount();
+    if (!m) {
+        print(fb, "kifs sb: no root filesystem mounted\n");
+        return;
+    }
+    if (!m->fs_name || strcmp(m->fs_name, "kifs") != 0) {
+        print(fb, "kifs sb: root filesystem is not KiFS\n");
+        return;
+    }
+    kifs_superblock_t sb;
+    if (!kifs_debug_get_superblock(m, &sb)) {
+        print(fb, "kifs sb: failed to read superblock from mount\n");
+        return;
+    }
+
+    print(fb, "KiFS superblock (selected):\n");
+    print(fb, "  sb_seq="); print_u64(fb, sb.sb_seq); print(fb, sb.dirty ? " (dirty)\n" : " (clean)\n");
+    print(fb, "  total_blocks="); print_u64(fb, sb.total_blocks);
+    print(fb, "  usable_blocks="); print_u64(fb, sb.usable_blocks);
+    print(fb, "  block_size="); print_u64(fb, sb.block_size); print(fb, "\n");
+
+    print(fb, "Layout (blocks):\n");
+    print(fb, "  journal: start="); print_u64(fb, sb.journal_start); print(fb, " count="); print_u64(fb, sb.journal_blocks); print(fb, "\n");
+    print(fb, "  block_bitmap: start="); print_u64(fb, sb.block_bitmap_start); print(fb, " count="); print_u64(fb, sb.block_bitmap_blocks); print(fb, "\n");
+    print(fb, "  inode_bitmap: start="); print_u64(fb, sb.inode_bitmap_start); print(fb, " count="); print_u64(fb, sb.inode_bitmap_blocks); print(fb, "\n");
+    print(fb, "  inode_table:  start="); print_u64(fb, sb.inode_table_start); print(fb, " count="); print_u64(fb, sb.inode_table_blocks); print(fb, "\n");
+    print(fb, "  data:        start="); print_u64(fb, sb.data_start); print(fb, " count="); print_u64(fb, sb.data_blocks); print(fb, "\n");
+
+    print(fb, "Inodes:\n");
+    print(fb, "  inode_count="); print_u64(fb, sb.inode_count); print(fb, "\n");
+    print(fb, "  root_ino="); print_u64(fb, sb.root_ino);
+    print(fb, "  orphan_ino="); print_u64(fb, sb.orphan_ino); print(fb, "\n");
+}
+
+static void cmd_kifs(struct limine_framebuffer* fb, const char* args) {
+    args = trim_spaces(args);
+    if (!args || !*args) {
+        print(fb, "Usage: kifs <subcmd> ...\n");
+        print(fb, "  kifs sb\n");
+        print(fb, "  kifs bmdump [nbits]\n");
+        print(fb, "  kifs mkfs <part> [inodes]\n");
+        print(fb, "  kifs mount [part]\n");
+        return;
+    }
+
+    // extract first token
+    char sub[16];
+    uint32_t i=0;
+    while (args[i] && args[i] != ' ' && i < (sizeof(sub)-1)) { sub[i]=args[i]; i++; }
+    sub[i]='\0';
+    const char* rest = skip_token(args);
+
+    if (strcmp(sub, "sb") == 0) {
+        cmd_kifs_sb(fb);
+        return;
+    }
+    if (strcmp(sub, "bmdump") == 0) {
+        cmd_kifsbmdump(fb, rest);
+        return;
+    }
+    if (strcmp(sub, "mkfs") == 0) {
+        cmd_mkfs_kifs(fb, rest);
+        return;
+    }
+    if (strcmp(sub, "mount") == 0) {
+        cmd_mount(fb, rest);
+        return;
+    }
+
+    print(fb, "kifs: unknown subcommand. Try: kifs sb | bmdump | mkfs | mount\n");
+}
+
+typedef struct {
+    struct limine_framebuffer* fb;
+} ls_ctx_t;
+
+static bool ls_cb(const char* name, uint32_t ino, void* user) {
+    (void)ino;
+    ls_ctx_t* ctx = (ls_ctx_t*)user;
+    print(ctx->fb, name);
+    print(ctx->fb, "\n");
+    return true;
+}
+
+static void cmd_ls(struct limine_framebuffer* fb, const char* args) {
+    const char* path = trim_spaces(args);
+    if (!path || !*path) path = "/";
+
+    vnode_t* vn = NULL;
+    if (!vfs_resolve(path, &vn) || !vn) {
+        print(fb, "ls: not found\n");
+        return;
+    }
+
+    if (vn->type != VNODE_DIR) {
+        print(fb, "ls: not a directory\n");
+        vfs_vnode_put(vn);
+        return;
+    }
+
+    if (!vn->ops || !vn->ops->readdir) {
+        print(fb, "ls: no readdir\n");
+        vfs_vnode_put(vn);
+        return;
+    }
+
+    ls_ctx_t ctx = { .fb = fb };
+    vn->ops->readdir(vn, ls_cb, &ctx);
+    vfs_vnode_put(vn);
+}
+
+static void cmd_stat(struct limine_framebuffer* fb, const char* args) {
+    const char* path = trim_spaces(args);
+    if (!path || !*path) {
+        print(fb, "Usage: stat <path>\n");
+        return;
+    }
+
+    vnode_t* vn = NULL;
+    if (!vfs_resolve(path, &vn) || !vn) {
+        print(fb, "stat: not found\n");
+        return;
+    }
+
+    if (!vn->ops || !vn->ops->stat) {
+        print(fb, "stat: no stat\n");
+        vfs_vnode_put(vn);
+        return;
+    }
+
+    vfs_stat_t st;
+    if (!vn->ops->stat(vn, &st)) {
+        print(fb, "stat: failed\n");
+        vfs_vnode_put(vn);
+        return;
+    }
+
+    print(fb, "ino=");
+    print_u32(fb, st.ino);
+    print(fb, " type=");
+    print(fb, st.type == VNODE_DIR ? "dir" : "file");
+    print(fb, " size=");
+    print_u64(fb, st.size);
+    print(fb, " links=");
+    print_u32(fb, st.link_count);
+    print(fb, "\n");
+
+    vfs_vnode_put(vn);
+}
+
+static void cmd_cat(struct limine_framebuffer* fb, const char* args) {
+    const char* path = trim_spaces(args);
+    if (!path || !*path) {
+        print(fb, "Usage: cat <path>\n");
+        return;
+    }
+
+    vnode_t* vn = NULL;
+    if (!vfs_resolve(path, &vn) || !vn) {
+        print(fb, "cat: not found\n");
+        return;
+    }
+
+    if (!vn->ops || !vn->ops->read) {
+        print(fb, "cat: no read\n");
+        vfs_vnode_put(vn);
+        return;
+    }
+
+    uint8_t* tmp = (uint8_t*)kmalloc(512);
+    if (!tmp) {
+        print(fb, "cat: oom\n");
+        vfs_vnode_put(vn);
+        return;
+    }
+
+    uint64_t off = 0;
+    while (1) {
+        int64_t n = vn->ops->read(vn, off, tmp, 512);
+        if (n < 0) {
+            print(fb, "cat: read error\n");
+            break;
+        }
+        if (n == 0) break;
+        for (int64_t i = 0; i < n; i++) {
+            putc_fb(fb, (char)tmp[i]);
+        }
+        off += (uint64_t)n;
+    }
+
+    putc_fb(fb, '\n');
+    kfree(tmp);
+    vfs_vnode_put(vn);
+}
+
 // -------- Unknown --------
 
 static void cmd_unknown(struct limine_framebuffer *fb, const char *cmd) {
@@ -1052,6 +1367,41 @@ static void execute_command(struct limine_framebuffer *fb, char *input) {
 
     if (strcmp(input, "bcacheflushp") == 0) {
         cmd_bcacheflushp(fb, args);
+        return;
+    }
+
+    if (strcmp(input, "mount") == 0) {
+        cmd_mount(fb, args);
+        return;
+    }
+
+    if (strcmp(input, "kifs") == 0) {
+        cmd_kifs(fb, args);
+        return;
+    }
+
+    if (strcmp(input, "mkfs.kifs") == 0) {
+        cmd_mkfs_kifs(fb, args);
+        return;
+    }
+
+    if (strcmp(input, "kifsbmdump") == 0) {
+        cmd_kifsbmdump(fb, args);
+        return;
+    }
+
+    if (strcmp(input, "ls") == 0) {
+        cmd_ls(fb, args);
+        return;
+    }
+
+    if (strcmp(input, "stat") == 0) {
+        cmd_stat(fb, args);
+        return;
+    }
+
+    if (strcmp(input, "cat") == 0) {
+        cmd_cat(fb, args);
         return;
     }
 
