@@ -203,3 +203,49 @@ uint64_t vmm_get_physical(page_table_t* pt, uint64_t virt) {
     
     return PTE_GET_ADDR(pt_entry);
 }
+
+bool vmm_get_mapping(page_table_t* pt, uint64_t virt, uint64_t* out_phys, uint64_t* out_flags) {
+    uint64_t aligned_virt;
+    size_t pml4_idx;
+    size_t pdpt_idx;
+    size_t pd_idx;
+    size_t pt_idx;
+    uint64_t pml4_entry;
+    uint64_t* pdpt;
+    uint64_t pdpt_entry;
+    uint64_t* pd;
+    uint64_t pd_entry;
+    uint64_t* page_table;
+    uint64_t pt_entry;
+
+    if (!pt) return false;
+
+    aligned_virt = PAGE_ALIGN_DOWN(virt);
+    pml4_idx = PML4_INDEX(aligned_virt);
+    pdpt_idx = PDPT_INDEX(aligned_virt);
+    pd_idx = PD_INDEX(aligned_virt);
+    pt_idx = PT_INDEX(aligned_virt);
+
+    pml4_entry = pt->pml4_virt[pml4_idx];
+    if (!(pml4_entry & PAGE_PRESENT)) return false;
+
+    pdpt = phys_to_virt(PTE_GET_ADDR(pml4_entry));
+    pdpt_entry = pdpt[pdpt_idx];
+    if (!(pdpt_entry & PAGE_PRESENT)) return false;
+
+    pd = phys_to_virt(PTE_GET_ADDR(pdpt_entry));
+    pd_entry = pd[pd_idx];
+    if (!(pd_entry & PAGE_PRESENT)) return false;
+
+    page_table = phys_to_virt(PTE_GET_ADDR(pd_entry));
+    pt_entry = page_table[pt_idx];
+    if (!(pt_entry & PAGE_PRESENT)) return false;
+
+    if (out_phys) {
+        *out_phys = PTE_GET_ADDR(pt_entry);
+    }
+    if (out_flags) {
+        *out_flags = PTE_GET_FLAGS(pt_entry);
+    }
+    return true;
+}

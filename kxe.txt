@@ -1,0 +1,713 @@
+KXE v0.1 -- Character Sheet + Implementation Checklist
+Part A -- KXE v0.1 Character Sheet (Integrated)
+
+0. Purpose and Philosophy
+KXE is KiwiOS's native executable image format.
+
+It is designed for a hobby OS that already has:
+
+ring 3 entry working
+
+basic syscalls
+
+a simple process model
+
+KiFS as the native filesystem
+
+future plans for a real loader, scheduler, and userspace toolchain
+
+Core goals
+Easy for the kernel to validate safely
+
+Easy to generate from a normal ELF build
+
+Easy to reason about as a beginner
+
+Maps cleanly into userspace memory
+
+Leaves room for future features without forcing a reformat right away
+
+Non-goals (v0.1)
+Position-independent executables
+
+Dynamic linking
+
+Shared libraries
+
+TLS
+
+C++ exceptions or unwind tables
+
+Demand paging from the executable file
+
+Fancy metadata in the first version
+
+Global v0.1 rules
+Architecture: x86-64 only
+
+Endianness: little-endian
+
+Page size: fixed 4096 bytes
+
+Address model: fixed virtual addresses
+
+Link model: static only
+
+Unknown header flags: reject
+
+Unknown section types: reject
+
+Writable + executable sections are forbidden
+
+Header checksum is REQUIRED
+
+Section checksums are a future feature, not part of v0.1
+
+
+1. Fundamental Constants
+Magic: "KXE\0"
+
+Version: 0.1
+
+Header size: 64 bytes
+
+Section entry size: 48 bytes
+
+Maximum section count: 16
+
+Header + section table must fit in the first 4096 bytes of the file
+
+Recommended image base: 0x0000000000400000
+
+Recommended initial stack top: 0x0000000000800000
+
+Recommended user image range: lower canonical half only
+
+brk base: first page after the highest loaded section
+
+Recommended minimal section set:
+.text
+
+.rodata
+
+.data
+
+.bss
+
+
+2. File Model
+A KXE file describes a process image, not a linkable object file.
+
+Layout:
+Bytes 0..4095:
+header
+
+section table
+
+padding
+
+Bytes 4096..end:
+section payload data
+
+Important ideas
+The kernel should be able to validate the entire layout by reading the
+first 4096 bytes and then only fetching the section payloads it decides
+to trust.
+
+Sections describe what memory must exist in the process image.
+
+Sections do not need to appear in any special order in the file, but the
+virtual address ranges they describe must not overlap.
+
+BSS is represented by a section whose memory size is larger than its file
+size, or by a NOBITS section with file_size == 0.
+
+KXE v0.1 is intentionally closer to "a stripped, loader-friendly memory
+image" than to "a full linker format."
+
+
+3. Header
+Header fields (exact v0.1 layout, 64 bytes total)
+magic[4]
+
+version_major (u16)
+
+version_minor (u16)
+
+flags (u32)
+
+header_size (u16)
+
+section_entry_size (u16)
+
+section_count (u16)
+
+abi_version (u16)
+
+header_crc32 (u32)
+
+entry_vaddr (u64)
+
+section_table_offset (u64)
+
+image_min_vaddr (u64)
+
+image_max_vaddr (u64)
+
+file_size (u64)
+
+Field meaning
+magic:
+"KXE\0"
+
+version_major / version_minor:
+format version, starting at 0.1
+
+flags:
+must be 0 in v0.1
+
+header_size:
+must be 64 in v0.1
+
+section_entry_size:
+must be 48 in v0.1
+
+section_count:
+number of section entries that follow
+
+abi_version:
+KiwiOS userspace ABI version expected by the image
+
+header_crc32:
+CRC32 of the 64-byte header with this field treated as zero during the
+checksum calculation
+
+entry_vaddr:
+initial user RIP
+
+section_table_offset:
+absolute file offset of the section table, normally 64
+
+image_min_vaddr / image_max_vaddr:
+inclusive-low, exclusive-high bounds for the image's described virtual
+address space
+
+file_size:
+total file length expected by the loader
+
+Validation rules
+magic must match exactly
+
+major/minor version must be supported
+
+flags must contain no unknown bits
+
+header_size must equal 64
+
+section_entry_size must equal 48
+
+section_count must be in the range 1..16
+
+section_table_offset must be at least header_size
+
+section_table_offset + section_count * 48 must be <= 4096
+
+image_min_vaddr must be < image_max_vaddr
+
+entry_vaddr must fall within at least one executable section
+
+file_size must match the actual file length
+
+header_crc32 must validate before any section payload is trusted
+
+
+4. Section Table Entries
+Section entry fields (exact v0.1 layout, 48 bytes total)
+name[8]
+
+type (u16)
+
+flags (u16)
+
+reserved (u32)
+
+vaddr (u64)
+
+vsize (u64)
+
+file_offset (u64)
+
+file_size (u64)
+
+Section type values
+1 = LOAD
+
+2 = NOBITS
+
+Reserved for future versions:
+3 = NOTE
+
+4 = RELOC
+
+5 = SYMBOLS
+
+6 = TLS
+
+Section flag values
+bit 0 = READ
+
+bit 1 = WRITE
+
+bit 2 = EXEC
+
+Reserved for future versions:
+bit 3 = HASHED
+
+bit 4 = COMPRESSED
+
+bit 5 = DISCARDABLE
+
+Field meaning
+name:
+8-byte NUL-padded ASCII section name, such as ".text" or ".bss"
+
+type:
+how the loader should interpret the section
+
+flags:
+memory permissions and future section properties
+
+reserved:
+must be zero in v0.1
+
+vaddr:
+virtual address where the section begins
+
+vsize:
+size of the section in memory
+
+file_offset:
+absolute file offset for section data
+
+file_size:
+size of the section payload in the file
+
+Validation rules
+type must be LOAD or NOBITS in v0.1
+
+flags must contain only READ/WRITE/EXEC bits in v0.1
+
+reserved must be zero
+
+vsize must be non-zero
+
+vaddr must be page-aligned
+
+vaddr must be in user space
+
+LOAD sections must satisfy file_size <= vsize
+
+NOBITS sections must have file_size == 0
+
+WRITE + EXEC together is forbidden
+
+file_offset + file_size must stay within file_size from the header
+
+After rounding each section's memory range up to page boundaries, no
+two sections may overlap
+
+All sections must fit within [image_min_vaddr, image_max_vaddr)
+
+
+5. Loader Rules
+Kernel-side loading policy for v0.1
+Read the first page of the file
+
+Validate the header
+
+Validate every section entry
+
+Create a process and a fresh user page table
+
+For each section:
+allocate enough physical pages for align_up(vsize, 4096)
+
+map them at vaddr with PAGE_USER and the correct writable bit
+
+copy file_size bytes from the KXE payload into the mapped memory
+
+zero the remaining bytes up to vsize
+
+zero any padding to the end of the final mapped page
+
+Allocate a separate user stack
+
+Set process->saved_rip = entry_vaddr
+
+Set process->saved_rsp = initial user stack top
+
+Set process->saved_rflags = 0x202 or equivalent sane initial flags
+
+Set process->brk_base and process->brk_current to align_up(image_max_vaddr, 4096)
+
+Allocate and attach a kernel stack for syscall/interrupt entry
+
+The loader must refuse to partially run a process if any section fails to
+allocate, map, or validate.
+
+
+6. Validation and Safety Model
+KXE's main safety rule:
+If the file layout is ambiguous or invalid, reject the image.
+
+Reject on:
+integer overflow in offset or size math
+
+truncated header
+
+truncated section table
+
+truncated section payload
+
+entry point outside executable memory
+
+section overlap
+
+section outside user range
+
+unknown flags or types
+
+W+X mapping request
+
+The kernel should prefer a hard load failure over a permissive guess.
+
+KXE v0.1 is not trying to recover broken files. It is trying to be small,
+strict, and unsurprising.
+
+
+7. Initial Userspace ABI Expectations
+KXE v0.1 assumes a very small userspace ABI.
+
+Calling convention
+Userspace code follows the x86-64 System V ABI internally.
+
+Compiler expectations
+-ffreestanding
+
+-nostdlib
+
+-mno-red-zone
+
+Linker expectations
+Programs are linked for fixed virtual addresses.
+
+No relocations are emitted into KXE v0.1.
+
+Process entry expectations
+RIP starts at entry_vaddr
+
+RSP starts at the top of a newly mapped user stack
+
+The stack should be 16-byte aligned at program entry
+
+argc = 0 and argv = NULL in v0.1 unless KiwiOS chooses to synthesize them later
+
+envp = NULL in v0.1
+
+Userspace support expectations
+A tiny crt0 provides _start
+
+_start calls main
+
+main returns an int
+
+crt0 turns main's return value into sys_exit(status)
+
+There is no TLS, no auxv, no dynamic linker, and no constructor list yet
+
+
+8. ELF-to-KXE Mapping
+The simplest way to build KXE is:
+C source -> ELF64 executable -> elf2kxe -> KXE file
+
+Converter input rules
+ELF64
+
+little-endian
+
+x86-64
+
+ET_EXEC for v0.1
+
+Use program headers, not section headers, as the source of truth
+
+Suggested mapping
+PF_R | PF_X -> LOAD section with READ | EXEC
+
+PF_R only -> LOAD section with READ
+
+PF_R | PF_W -> LOAD section with READ | WRITE
+
+If ELF memsz > filesz, either:
+keep one section with file_size < vsize
+
+or split the zero tail into a NOBITS section
+
+Entry point
+Copy ELF e_entry into KXE entry_vaddr
+
+File layout rules
+Write the header first
+
+Write the section table next
+
+Pad the first page to 4096 bytes
+
+Write payloads after that
+
+Payloads should be at least 16-byte aligned in the file for cleaner tooling
+
+The converter should compute header_crc32 as its last header step
+
+
+9. Recommended v0.1 Section Set
+These names are conventions, not hard requirements, but they keep the
+format understandable:
+
+.text
+Executable code
+
+.rodata
+Read-only constants
+
+.data
+Initialized writable data
+
+.bss
+Zero-initialized writable data
+
+Avoid section sprawl in v0.1.
+
+The point of KXE right now is to load simple static programs from disk,
+not to mirror every feature ELF can express.
+
+
+10. Minimal Tooling Expectations
+v0.1 tooling should include:
+elf2kxe
+
+a userspace linker script
+
+crt0
+
+a syscall wrapper
+
+tiny libc pieces such as memcpy, memset, strlen, puts
+
+Recommended extra tools:
+kxeinfo:
+dump header and section table for debugging
+
+kxecheck:
+validate a KXE file on the host the same way the kernel validator does
+
+This matters because executable-format bugs are easier to debug on the
+host than inside the kernel.
+
+
+11. Future Evolution (v0.2+ / v1 and beyond)
+KXE should stay simple in the kernel, but it can still grow into a very
+strong executable format over time.
+
+The right goal is not "copy ELF" or "copy PE."
+
+The right goal is:
+keep the loader small and safe
+
+add features only when KiwiOS can really use them
+
+make KiwiOS-specific policy first-class instead of bolting it on later
+
+High-value future features
+
+Relocations + PIE
+Allow the same binary to load at different addresses.
+
+This is the path to ASLR and to less rigid linking.
+
+Dynamic linking
+Add import/export metadata, shared libraries, and a runtime linker only
+when the OS is ready.
+
+TLS
+Needed once threads exist and libc grows up.
+
+Debug metadata
+Add optional symbol tables, source line info, unwind data, or a detached
+debug-link mechanism so release images stay small.
+
+Integrity + trust
+Add per-section hashes, whole-file signatures, measured-boot hooks, or
+policy manifests so the kernel can decide what it trusts.
+
+Capability manifests
+KXE can be better than generic formats by carrying KiwiOS-specific policy
+cleanly:
+minimum kernel ABI
+
+required syscalls or capabilities
+
+required interpreter or runtime
+
+sandbox hints
+
+package or build identity
+
+Performance metadata
+Compression flags
+
+demand-paging hints
+
+hot/cold section tags
+
+huge-page hints where useful
+
+Compatibility metadata
+Explicit compatible / incompatible feature bitsets
+
+clear loader refusal rules
+
+clean forward-evolution story
+
+Reproducibility
+Canonical section ordering, stable build IDs, and host validation tools
+can make KXE easier to debug and reproduce than many general-purpose
+formats.
+
+"Better than other executable formats" for KiwiOS should mean:
+smaller kernel loader
+
+stricter validation
+
+cleaner ABI story
+
+first-class integrity and capability metadata
+
+less historical baggage
+
+
+12. Mental Model
+KXE v0.1 is best thought of as:
+
+"An ELF executable that has already been simplified into the exact memory
+image KiwiOS wants to map."
+
+That makes it a good beginner format:
+small enough to understand
+
+strict enough to validate
+
+powerful enough to get real programs running
+
+
+Part B -- Implementation Checklist (Step-by-Step, No Code)
+
+Overview: Phases and Milestones
+Goal order:
+Get real static programs loading from disk
+
+Keep the kernel loader easy to debug
+
+Build the userspace toolchain around the format
+
+Reserve room for future upgrades without overbuilding now
+
+Stage 1 -- Freeze KXE v0.1
+Write down the header fields
+
+Write down the section entry fields
+
+Decide exact validation rules
+
+Keep v0.1 static and fixed-address
+
+Stage 2 -- Kernel validator
+Define C structs for the header and section entries
+
+Implement strict bounds and overlap checks
+
+Refuse unknown bits and types
+
+Require entry point inside an executable section
+
+Stage 3 -- Kernel loader
+Create a process
+
+Map sections into the new page table
+
+Allocate a user stack and kernel stack
+
+Set RIP/RSP/RFLAGS
+
+Return a process ready to run
+
+Stage 4 -- Host converter
+Build elf2kxe
+
+Read ELF program headers
+
+Map PT_LOAD segments into KXE sections
+
+Write the header, table, and payloads
+
+Compute the header checksum
+
+Stage 5 -- Minimal userspace runtime
+crt0
+
+syscall wrapper
+
+small libc
+
+linker script
+
+Stage 6 -- First real test from disk
+Build /bin/hello as ELF
+
+Convert it to KXE
+
+Copy it into KiFS
+
+Load it with exec
+
+Verify it prints and exits
+
+Stage 7 -- Debugging and quality-of-life tools
+kxeinfo
+
+kxecheck
+
+better loader logs
+
+error codes instead of a generic load failure
+
+Stage 8 -- KXE growth path
+Relocations and PIE
+
+ASLR-ready loader changes
+
+optional debug sections or debug-link support
+
+integrity manifests and signatures
+
+capability metadata
+
+TLS
+
+shared-library groundwork
+
+performance hints and optional compression
+
+Keep the rule:
+every new feature must justify its cost in both the kernel loader and the
+host tooling.

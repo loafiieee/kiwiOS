@@ -1,0 +1,1141 @@
+KiFS v0.1 — Character Sheet + Implementation Checklist 
+Part A — KiFS v0.1 Character Sheet (Integrated)
+0. Purpose and Philosophy
+KiFS is a simple, robust, educational filesystem designed for a hobby OS with:
+4 KiB block cache
+
+
+synchronous block I/O
+
+
+no processes/users yet
+
+
+future plans for journaling
+
+
+Core goals
+Easy to reason about
+
+
+Supports very large files (100 GB+ comfortably)
+
+
+Never corrupt filesystem structure on crash
+
+
+Prefer leaking space over corrupting metadata
+
+
+Extensible to journaling (v0.2+) without reformatting
+
+
+Non-goals (v0.1)
+High directory lookup performance
+
+
+Perfect crash recovery (journaling)
+
+
+Online resizing
+
+
+xattrs/ACLs/compression/CoW
+
+
+Global v0.1 rules
+Endianness: little-endian for all on-disk integers
+
+
+Block size: fixed 4096 bytes
+
+
+On-disk structures aligned to 4 KiB blocks
+
+
+No assumption of atomic 4 KiB writes
+
+
+Superblock checksum REQUIRED
+
+
+Directory-block + extent-node checksums OPTIONAL but recommended (feature flag)
+
+
+Even if checksums disabled: still require magic/version/type/count/payload bounds for safe parsing
+
+
+
+1. Fundamental Constants
+Block size: 4096 bytes
+
+
+Addressing unit: blocks (not sectors)
+
+
+Max filename length: 255 bytes
+
+
+Case sensitivity: case-sensitive
+
+
+Max filesystem size: 16 TiB
+
+
+Max file size: 16 TiB
+
+
+Sparse files: supported
+
+
+Journal reservation: last 1% of disk blocks (reserved, unused in v0.1)
+
+
+Max extent-tree height: 3
+
+
+Pinned on-disk integer widths (v0.1)
+Disk block numbers: u32 (fits exactly 16 TiB at 4 KiB blocks)
+
+
+Inode numbers: u32
+
+
+File size: u64 bytes
+
+
+Timestamps: u64 seconds since epoch (mtime/ctime only)
+
+
+
+2. Structured Block Model (Crash Safety Foundation)
+Structured blocks are any 4 KiB blocks parsed as metadata:
+superblocks
+
+
+inode-table blocks (inode records)
+
+
+directory blocks
+
+
+extent-tree nodes
+
+
+(recommended) bitmap blocks
+
+
+Structured block header (conceptual, required fields)
+ Every structured block begins with a header including:
+magic (4 bytes)
+
+
+version (u16)
+
+
+block_type (u16)
+
+
+header_bytes (u16)
+
+
+payload_bytes (u16) ← bounds scanning
+
+
+flags (u32)
+
+
+optional checksum (u32 CRC32)
+
+
+Validation rules
+header_bytes + payload_bytes <= 4096
+
+
+payload_bytes is the maximum parsable data region
+
+
+If checksum feature is enabled for this block type: checksum must validate
+
+
+Torn-write rule (critical)
+If a structured block fails validation, it is treated as absent.
+ KiFS never follows pointers from invalid blocks.
+Impact:
+Allowed: truncation, sparse reads, leaked space
+
+
+Forbidden: metadata corruption that spreads via mis-parsing
+
+
+
+3. Disk Layout (Fixed Layout)
+Let:
+N = total blocks
+
+
+journal_blocks = floor(N / 100)
+
+
+usable_blocks = N - journal_blocks
+
+
+Layout order:
+Block 0: superblock primary
+
+
+Block 1: superblock backup
+
+
+Blocks A..B: block bitmap (covers [0..usable_blocks-1])
+
+
+Blocks C..D: inode bitmap
+
+
+Blocks E..F: inode table
+
+
+Blocks G..H: data region (allocations >= data_start)
+
+
+Blocks I..N-1: reserved journal region (never allocated in v0.1)
+
+
+All offsets/lengths stored in superblock.
+Invariants:
+No allocation from journal region in v0.1
+
+
+Superblock backup is a byte-for-byte copy except fields that must differ (sb_blockno and checksum)
+
+
+
+4. Superblock
+Fields (conceptual)
+Magic "KIFS"
+
+
+FS version major/minor
+
+
+Block size (4096)
+
+
+Total block count
+
+
+Usable block count
+
+
+Journal start + count
+
+
+Block bitmap start + length
+
+
+Inode bitmap start + length
+
+
+Inode table start + length
+
+
+Data region start + length
+
+
+Total inode count
+
+
+Root inode number (1)
+
+
+Orphan inode number (recommended 2; 0 if unused)
+
+
+Dirty flag (clean/dirty)
+
+
+Feature flags (see below)
+
+
+Optional mount_count + last_mount_time
+
+
+sb_seq (u64) monotonically increasing
+
+
+Superblock checksum (CRC32) REQUIRED
+
+
+Dirty discipline
+On mount: set dirty=true and write superblock(s)
+
+
+On clean unmount: set dirty=false and write superblock(s)
+
+
+dirty==true at mount means previous unclean shutdown
+
+
+Two superblocks: selection on mount
+Read both copies
+
+
+Each must validate magic/version/layout bounds + checksum
+
+
+If only one valid: use it
+
+
+If both valid: choose highest sb_seq
+
+
+If tie: prefer primary
+
+
+Write discipline
+Increment sb_seq on every superblock update
+
+
+Write primary first, then backup (both get same sb_seq)
+
+
+Feature flags model (compatibility)
+features_compatible
+
+
+features_ro_compatible
+
+
+features_incompatible
+
+
+Mount rules:
+unknown incompatible bit → refuse mount
+
+
+unknown ro-compatible bit → mount read-only
+
+
+unknown compatible bit → ignore
+
+
+
+5. Inodes
+Identity
+Inode number = index in inode table
+
+
+Inode 0 reserved/invalid
+
+
+Inode 1 root directory
+
+
+Inode 2 recommended orphan file (if enabled)
+
+
+Allocation
+Fixed inode count at mkfs
+
+
+Tracked by inode bitmap
+
+
+Inode record
+Size: 256 bytes
+
+
+16 inodes per 4 KiB inode-table block
+
+
+Begins with magic "KINO" and version
+
+
+Safe parsing sanity:
+
+
+type in {file, dir}
+
+
+inline extent count <= 8
+
+
+Inode contents (conceptual)
+Type (file/dir)
+
+
+Mode bits (rwx)
+
+
+UID/GID (future-proof; not used yet)
+
+
+Link count
+
+
+mtime, ctime (no atime)
+
+
+File size (u64 bytes)
+
+
+Inline extents (max 8)
+
+
+Extent-tree root block pointer (if needed)
+
+
+Extent-tree height (0 = inline-only)
+
+
+Optional inode checksum (feature-flagged)
+
+
+Bad inode (fails validation) is treated as non-existent.
+
+6. Extents
+Extent fields (all in 4 KiB blocks):
+file_block_start
+
+
+disk_block_start (absolute disk block number)
+
+
+block_count
+
+
+Rules:
+Extents sorted by file_block_start
+
+
+No overlaps in file space
+
+
+No overlaps in disk space (no double ownership)
+
+
+Adjacent extents should be merged when possible (file + disk adjacency)
+
+
+disk blocks must be in data region and outside journal region
+
+
+
+7. Extent Tree
+Purpose: store extents beyond 8 inline ones.
+Structure
+keyed by file_block_start
+
+
+each node is one 4 KiB structured block
+
+
+max height: 3
+
+
+nodes stored in data region
+
+
+Node header includes
+magic "KEXT"
+
+
+version
+
+
+node_type (internal/leaf)
+
+
+height (definition below)
+
+
+entry_count
+
+
+payload_bytes bounds
+
+
+optional checksum
+
+
+Height definition
+height=0 means leaf node
+
+
+height>0 means internal node
+
+
+Internal node entries
+(first_file_block_in_child, child_blockno)
+
+
+sorted ascending by key
+
+
+Lookup rule:
+choose the entry with the largest key <= target file block
+
+
+follow that child
+
+
+Leaf nodes
+contain extent records sorted by file_block_start
+
+
+Validation rules:
+sorted
+
+
+no overlaps
+
+
+child pointers in range and not in journal
+
+
+if validation fails: treat node/subtree as absent (sparse/truncate behavior permitted)
+
+
+
+8. Sparse Files
+A file block is sparse if:
+inside inode.size
+
+
+and no extent covers it
+
+
+Reads return zero-filled data.
+ Writes allocate blocks and create extents.
+
+9. Directories
+A directory is a file whose contents are parsed as directory blocks.
+Directory blocks
+sequence of 4 KiB blocks
+
+
+each begins with a structured header:
+
+
+magic "KDIR"
+
+
+version
+
+
+used_bytes (bounded scanning)
+
+
+optional checksum
+
+
+optional parent inode hint
+
+
+Directory entries (dirents)
+ Each entry contains:
+inode number (0 means unused/deleted)
+
+
+name length (0..255)
+
+
+name bytes (not NUL-terminated)
+
+
+record length reclen (for skipping/reuse), 8-byte aligned
+
+
+optional file-type hint
+
+
+Parsing rule
+Entries are parsed only within used_bytes
+
+
+If reclen/namelen invalid for remaining bytes, stop scanning that block
+
+
+Lookup rule
+linear scan (v0.1)
+
+
+case-sensitive
+
+
+If duplicates exist (possible after crash), first valid match wins
+
+
+fsck may later remove duplicates
+
+
+Special entries:
+. points to self
+
+
+.. points to parent (root’s .. points to itself)
+
+
+
+10. Hard Links
+Multiple dirents may point to same inode
+
+
+Link count tracks references
+
+
+Data freed only when link count reaches zero and orphan cleanup runs
+
+
+
+11. Lazy Free / Orphan Handling
+When link count reaches zero:
+inode is added to an orphan structure
+
+
+blocks/inode not freed immediately
+
+
+Recommended in v0.1:
+orphan file at inode 2
+
+
+append-only records: { inode_number, optional timestamp/gen }
+
+
+crash safety: last record may be lost; may leak; structure should not corrupt
+
+
+Alternative allowed:
+orphan linked list (inode has orphan_next; superblock has orphan_head)
+
+
+update ordering:
+
+
+write inode.orphan_next
+
+
+write superblock orphan_head
+
+
+
+12. Crash Safety Model (v0.1)
+Design rule:
+Never leave on-disk structures pointing to uninitialized or reused space.
+Allowed:
+leaked space
+
+
+orphaned inodes
+
+
+duplicate dirents
+
+
+link count mismatches (fsck-fixable)
+
+
+Forbidden:
+dirent pointing to garbage/invalid inode
+
+
+inode pointing to freed/reused blocks (aliasing)
+
+
+bitmap says free while referenced
+
+
+Key policy:
+Any structured block that fails validation is treated as absent.
+
+13. Required Write Ordering (High-Level)
+A) Extend file (allocate new blocks)
+mark blocks allocated in bitmap
+
+
+write data blocks
+
+
+update extents (inline/tree nodes)
+
+
+update inode (size/mtime/ctime)
+
+
+B) Create new file
+allocate inode (inode bitmap)
+
+
+write initialized inode (link_count=1, size=0)
+
+
+write directory entry
+
+
+update directory inode mtime/ctime
+
+
+C) Unlink
+remove directory entry (ino=0)
+
+
+decrement inode link_count; write inode
+
+
+if link_count==0: add to orphan structure
+
+
+
+14. Rename Semantics (Unix-like, Best-Effort v0.1)
+rename is atomic “in intent”
+
+
+destination file may be replaced
+
+
+cross-directory rename allowed
+
+
+without journal: after crash, source may exist, dest may exist, or both may exist
+
+
+forbidden: rename must not create pointers to invalid/uninitialized/reused metadata
+
+
+
+15. Journaling (Future v0.2+)
+last 1% reserved now
+
+
+planned metadata-only write-ahead journal + replay
+
+
+enabled via feature flag
+
+
+must not require reformatting
+
+
+
+16. Minimal Tooling Expectations
+v0.1 conceptual tools:
+mkfs.kifs
+
+
+mount
+
+
+ls, stat
+
+
+fsck.kifs later:
+
+
+bitmap says free but referenced → mark used
+
+
+dirents to invalid inode → remove/quarantine
+
+
+link_count mismatches → correct
+
+
+optionally reclaim leaked blocks
+
+
+
+17. Mental Model
+KiFS v0.1 ≈ ext2 layout + ext4-style extents + journaling-ready discipline
+ with strict “don’t mis-parse torn metadata” safety rules.
+
+Part B — Implementation Checklist (Step-by-Step, No Code)
+Overview: Phases & Milestones
+Goal order:
+VFS foundation (supports multiple FS)
+
+
+KiFS mount + read-only browse (fast win)
+
+
+KiFS file reads (inline extents → extent tree)
+
+
+Safe writes (ordered, flush boundaries)
+
+
+Orphan cleanup
+
+
+FAT support (read-only first) using the same VFS
+
+
+Test loop + tooling
+
+
+
+Phase 0 — Decide Root Mount Policy
+
+
+Decide whether a mount shell command can override default root
+
+
+Done when: kernel can consistently pick a root volume and report what it mounted.
+
+Phase 1 — VFS Layer (Minimal but Real)
+1.1 Core VFS data model
+
+
+Decide “cwd” behavior (optional). Minimum: only absolute paths from /.
+
+
+1.2 VFS operations needed for v0.1
+
+
+Later: write/create/mkdir/unlink/rename
+
+
+1.3 Path resolution
+
+
+Decide how you represent “root” and store it globally
+
+
+Done when: you can call vfs_resolve("/...") regardless of filesystem type.
+
+Phase 2 — Filesystem Driver Registry + Probing
+
+
+Define probe rules:
+
+
+KiFS: validate superblock(s)
+
+
+FAT: validate BPB + signature
+
+
+Done when: you can mount “whatever is on the partition” without hardcoding KiFS.
+
+Phase 3 — KiFS Mount + Read-Only Directory Walking (Get ls working)
+3.1 Block I/O conventions
+
+
+All KiFS reads/writes go through the 4 KiB cache layer
+
+
+3.2 Superblock selection
+
+
+Store derived layout constants in memory (bitmap/inode table/data_start/journal_start)
+
+
+3.3 Inode read
+
+
+Construct vnode for inode
+
+
+3.4 Directory parse
+
+
+Implement:
+
+
+readdir
+
+
+lookup (linear scan)
+
+
+Shell milestones
+
+
+stat /path
+
+
+Done when: you can mount KiFS and list the root directory reliably.
+
+Phase 4 — KiFS File Reads (Inline Extents First)
+4.1 Inline extent mapping
+
+
+Read data blocks via cache
+
+
+Shell milestone
+
+
+cat /file works for files that fit in inline extents
+
+
+Done when: small files can be read end-to-end with correct sparse behavior.
+
+Phase 5 — Extent Tree Reads (Large Files)
+
+
+If a node fails validation: treat subtree as absent (sparse/truncate allowed)
+
+
+Done when: large/fragmented files read correctly.
+
+Phase 6 — Write Support (Introduce Safely, In Order)
+6.1 Allocation primitives
+
+
+Ensure mkfs marks all metadata + journal reserved blocks as used (or excluded from usable range consistently)
+
+
+6.2 Flush discipline
+ Because cache may be write-back:
+
+
+Maintain write ordering (bitmap → data → metadata → dirent)
+
+
+6.3 Add write ops in low-risk order
+
+
+rename (best-effort semantics)
+
+
+Done when: you can create/write/readback files without corrupting metadata after forced resets (leaks allowed).
+
+Phase 7 — Orphans + Cleanup Pass
+
+
+On mount (or manual command):
+
+
+scan orphan records
+
+
+for each inode that still has link_count==0:
+
+
+free its extents/blocks
+
+
+free inode in bitmap
+
+
+ignore torn/invalid trailing record safely
+
+
+Done when: unlink never risks aliasing; space is reclaimed by cleanup.
+
+Phase 8 — FAT Support (USB/Removable) via VFS
+Read-only first
+
+
+FAT file read through VFS read
+
+
+Done when: mount can mount either KiFS or FAT and ls/cat work on both.
+
+Phase 9 — Testing & Tooling Loop
+
+
+Add shell test commands:
+
+
+kifscheck (mount + validate walk)
+
+
+kifswrite_test (create/write/readback)
+
+
+crash simulation: reset after step N, verify mount behavior (no corruption propagation)
+
+
+Done when: you have a repeatable “format → populate → verify → crash → reverify” loop.
+Decide which device/partition becomes root by default:
+
+
+Prefer first partition if present; else raw disk
+
+
+Decide mount fallback order:
+
+
+Try KiFS probe → else FAT probe → else “no filesystem”
+
+
+Define vnode concept (type, size, ops, fs-private pointer)
+
+
+Define mount object (fs driver instance + root vnode + underlying block device)
+
+
+lookup(dir, name) -> vnode
+
+
+readdir(dir) -> iterate entries
+
+
+read(vnode, offset, buf, len)
+
+
+stat(vnode) -> metadata
+
+
+Implement vfs_resolve("/a/b/c") using repeated lookup
+
+
+Create FS driver registry:
+
+
+name, probe(dev), mount(dev, flags)
+
+
+Implement probing flow:
+
+
+call drivers in order and mount the first that matches
+
+
+KiFS uses 4 KiB “filesystem blocks”
+
+
+Read block 0 and 1
+
+
+Validate: magic/version/blocksize/layout bounds/checksum
+
+
+Choose highest sb_seq
+
+
+Read inode N from inode table
+
+
+Validate inode header + sanity fields
+
+
+Treat directory data as a sequence of KDIR blocks
+
+
+For each KDIR block:
+
+
+validate header bounds
+
+
+scan entries only within used_bytes
+
+
+stop scanning block on invalid reclen/namelen
+
+
+mount (report selected filesystem)
+
+
+ls /
+
+
+Implement “file offset → file block index”
+
+
+Find covering inline extent
+
+
+If none: sparse read returns zeros
+
+
+Implement extent tree lookup:
+
+
+validate KEXT node header
+
+
+internal node rule: choose largest key ≤ target
+
+
+descend to leaf and find extent
+
+
+Validate extents:
+
+
+in-range disk blocks
+
+
+sorted order
+
+
+no overlaps
+
+
+never in journal region
+
+
+Block bitmap alloc (next-fit cursor; prefer contiguous runs)
+
+
+Inode bitmap alloc
+
+
+Never allocate from journal region
+
+
+Define “sync points” per FS operation
+
+
+At minimum: flush at the end of each high-level operation in v0.1
+
+
+Append-only writes to an existing file
+
+
+Create empty file
+
+
+Grow file with allocation + extents
+
+
+mkdir
+
+
+unlink + orphan recording
+
+
+Implement orphan structure (recommended: orphan file inode 2)
+
+
+On unlink when link_count hits 0:
+
+
+remove dirent
+
+
+decrement inode link_count
+
+
+append orphan record
+
+
+do not free blocks immediately
+
+
+FAT probe + mount through FS registry
+
+
+FAT directory listing through VFS readdir/lookup
+
+
+Host-side image workflow (recommended):
+
+
+create disk image
+
+
+partition (GPT/MBR)
+
+
+format KiFS partition
+
+
+optional FAT partition for mixed tests
+
+

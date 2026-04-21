@@ -4,12 +4,14 @@
 #include "arch/x86/gdt.h"
 #include "arch/x86/idt.h"
 #include "arch/x86/io.h"
+#include "arch/x86/syscall.h"
 #include "arch/x86/tss.h"
 #include "core/boot.h"
 #include "core/console.h"
 #include "core/keyboard.h"
 #include "core/log.h"
 #include "core/shell.h"
+#include "core/syscall.h"
 #include "libc/string.h"
 #include "memory/heap.h"
 #include "memory/hhdm.h"
@@ -95,6 +97,9 @@ void kmain(void) {
     tss_init();
     gdt_init();
     log_ok("cpu", "GDT/TSS configured");
+
+    syscall_init();
+    log_ok("cpu", "SYSCALL/SYSRET configured");
 
     x86_enable_sse();
     log_ok("cpu", "SSE enabled");

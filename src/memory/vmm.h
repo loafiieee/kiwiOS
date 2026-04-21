@@ -42,6 +42,10 @@ void vmm_unmap_page(page_table_t* pt, uint64_t virt);
 // Get the physical address for a virtual address
 uint64_t vmm_get_physical(page_table_t* pt, uint64_t virt);
 
+// Get the physical address and leaf PTE flags for a virtual address.
+// Returns false if the page is not mapped.
+bool vmm_get_mapping(page_table_t* pt, uint64_t virt, uint64_t* out_phys, uint64_t* out_flags);
+
 // Get the kernel page table
 page_table_t* vmm_get_kernel_page_table(void);
 

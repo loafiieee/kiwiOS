@@ -4,7 +4,9 @@
 #include "core/boot.h"
 #include "core/console.h"
 #include "core/keyboard.h"
+#include "core/kxe.h"
 #include "core/log.h"
+#include "core/usertest.h"
 #include "drivers/block/block.h"
 #include "libc/string.h"
 #include "memory/heap.h"
@@ -63,9 +65,11 @@ static const char* skip_token(const char* s) {
     return s;
 }
 
+static const char* trim_spaces(const char* s);
+
 // ================= Command functions =================
 static void cmd_help(struct limine_framebuffer *fb) {
-    print(fb, "Commands: help clear echo about crash meminfo memtest vmtest heaptest fbinfo scale partlist disktest mount kifs ls stat cat\n");
+    print(fb, "Commands: help clear echo about crash meminfo memtest vmtest heaptest fbinfo scale partlist disktest mount kifs ls stat cat exec usertest\n");
 }
 
 
@@ -1219,6 +1223,27 @@ static void cmd_cat(struct limine_framebuffer* fb, const char* args) {
     vfs_vnode_put(vn);
 }
 
+static void cmd_exec(struct limine_framebuffer* fb, const char* args) {
+    const char* path = trim_spaces(args);
+    if (!path || !*path) {
+        print(fb, "Usage: exec <path>\n");
+        return;
+    }
+
+    process_t* proc = kxe_load(path);
+    if (!proc) {
+        print(fb, "exec: load failed\n");
+        return;
+    }
+
+    print(fb, "exec: entering ring 3...\n");
+    process_enter(proc);
+}
+
+static void cmd_usertest(struct limine_framebuffer* fb) {
+    usertest_run(fb);
+}
+
 // -------- Unknown --------
 
 static void cmd_unknown(struct limine_framebuffer *fb, const char *cmd) {
@@ -1402,6 +1427,16 @@ static void execute_command(struct limine_framebuffer *fb, char *input) {
 
     if (strcmp(input, "cat") == 0) {
         cmd_cat(fb, args);
+        return;
+    }
+
+    if (strcmp(input, "exec") == 0) {
+        cmd_exec(fb, args);
+        return;
+    }
+
+    if (strcmp(input, "usertest") == 0) {
+        cmd_usertest(fb);
         return;
     }
 

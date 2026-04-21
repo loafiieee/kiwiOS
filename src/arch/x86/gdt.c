@@ -39,8 +39,9 @@ void gdt_init(void) {
     gdt_set_gate(0, 0, 0, 0, 0);                // Null
     gdt_set_gate(1, 0, 0xFFFFFFFF, 0x9A, 0xAF); // Kernel code (0x08)
     gdt_set_gate(2, 0, 0xFFFFFFFF, 0x92, 0xCF); // Kernel data (0x10)
-    gdt_set_gate(3, 0, 0xFFFFFFFF, 0xFA, 0xAF); // User code (0x18)
-    gdt_set_gate(4, 0, 0xFFFFFFFF, 0xF2, 0xCF); // User data (0x20)
+    // Phase 1: reorder user segments for future SYSRET use.
+    gdt_set_gate(3, 0, 0xFFFFFFFF, 0xF2, 0xCF); // User data (0x18)
+    gdt_set_gate(4, 0, 0xFFFFFFFF, 0xFA, 0xAF); // User code (0x20)
     
     // Set up TSS descriptor at index 5 (takes 2 entries in 64-bit mode)
     uint64_t tss_base = (uint64_t)&tss;

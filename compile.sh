@@ -1,8 +1,22 @@
 #!/bin/bash
+set -e
+
 rm -rf bin iso_root obj kiwi.img kiwiOS.iso
 bash rmidentifier.sh
 
+make -C tools clean
+make -C userspace clean
 make
+
+make -C tools
+make -C userspace
+
+if [ -f "disk_gpt.img" ]; then
+  ./tools/kifs_cp disk_gpt.img 1 userspace/bin/hello /hello
+  ./tools/kifs_cp disk_gpt.img 1 userspace/bin/badptr /badptr
+  ./tools/kifs_cp disk_gpt.img 1 userspace/bin/filetest /filetest
+fi
+
 # Download the latest Limine binary release for the 10.x branch, only if it doesn't exist.
 
 if [ ! -d "limine" ]; then
