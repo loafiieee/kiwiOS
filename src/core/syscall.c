@@ -8,11 +8,6 @@
 #define USER_VADDR_MIN 0x0000000000001000ull
 #define USER_VADDR_MAX 0x0000800000000000ull
 
-enum {
-    SYS_EXIT  = 0,
-    SYS_WRITE = 1,
-};
-
 bool validate_user_buffer(uint64_t addr, uint64_t len, bool needs_write) {
     process_t* proc = process_current();
     uint64_t end = 0;
@@ -107,16 +102,27 @@ void sys_exit(int code) {
     }
 }
 
+int64_t sys_getpid(void) {
+    process_t* proc = process_current();
+    if (!proc) {
+        return -1;
+    }
+
+    return (int64_t)proc->pid;
+}
+
 int64_t syscall_dispatch(syscall_frame_t* frame) {
     if (!frame) {
         return -1;
     }
 
     switch (frame->syscall_num) {
-        case SYS_EXIT:
+        case KIWI_SYS_EXIT:
             sys_exit((int)frame->rdi);
-        case SYS_WRITE:
+        case KIWI_SYS_WRITE:
             return sys_write((int)frame->rdi, (const void*)frame->rsi, frame->rdx);
+        case KIWI_SYS_GETPID:
+            return sys_getpid();
         default:
             return -1;
     }
