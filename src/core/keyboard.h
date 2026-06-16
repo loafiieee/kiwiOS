@@ -14,6 +14,8 @@ enum {
     KEY_ARROW_DOWN = -17,
     KEY_ARROW_LEFT = -18,
     KEY_ARROW_RIGHT = -19,
+    KEY_PAGE_UP = -20,
+    KEY_PAGE_DOWN = -21,
 };
 
 #endif // CORE_KEYBOARD_H

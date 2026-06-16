@@ -113,11 +113,9 @@ static int translate_scancode(uint8_t scancode) {
 
         switch (scancode) {
             case 0x49:
-                console_page_up();
-                return -1;
+                return KEY_PAGE_UP;
             case 0x51:
-                console_page_down();
-                return -1;
+                return KEY_PAGE_DOWN;
             case 0x48:
                 return KEY_ARROW_UP;
             case 0x50:
@@ -197,6 +195,15 @@ int keyboard_getchar(void) {
         int ch = keybuf_pop();
         if (ch >= 0) {
             return ch;
+        }
+
+        if (ch == KEY_PAGE_UP) {
+            console_page_up();
+            continue;
+        }
+        if (ch == KEY_PAGE_DOWN) {
+            console_page_down();
+            continue;
         }
 
         if (ch == KEY_ARROW_UP || ch == KEY_ARROW_DOWN ||

@@ -370,6 +370,15 @@ int64_t sys_read(int fd, void* buf, uint64_t len) {
                 continue;
             }
 
+            if (ch == KEY_PAGE_UP) {
+                console_page_up();
+                continue;
+            }
+            if (ch == KEY_PAGE_DOWN) {
+                console_page_down();
+                continue;
+            }
+
             if (ch == KEY_ARROW_UP) {
                 stdin_queue_escape(proc, 'A');
                 continue;
