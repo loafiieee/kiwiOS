@@ -7,6 +7,8 @@
 
 #define COM1 0x3F8
 
+static bool g_serial_ready = false;
+
 static inline void outb_u16(uint16_t port, uint8_t val) { outb(port, val); }
 static inline uint8_t inb_u16(uint16_t port) { return inb(port); }
 
@@ -15,6 +17,8 @@ static int serial_transmit_empty(void) {
 }
 
 bool serial_init(void) {
+    g_serial_ready = false;
+
     // Disable interrupts
     outb_u16(COM1 + 1, 0x00);
 
@@ -44,7 +48,12 @@ bool serial_init(void) {
 
     // Normal operation
     outb_u16(COM1 + 4, 0x0F);
+    g_serial_ready = true;
     return true;
+}
+
+bool serial_is_ready(void) {
+    return g_serial_ready;
 }
 
 void serial_putc(char c) {

@@ -4,15 +4,17 @@
 
 Your kernel boots via Limine, has a framebuffer console, PS/2 keyboard,
 AHCI disk driver, block cache, GPT partition support, a VFS layer, and
-KiFS read-only (ls, cat, stat work). You have a working in-kernel shell.
-mkfs.kifs can format a partition and create test files. FAT is present
-only as a stub in the VFS driver registry right now.
+KiFS read/write groundwork, FAT read-only mount support, a working
+userspace shell via `/init`, and a preemptive scheduler. KiFS is still
+the boot/root filesystem on the current disk image.
 
-Everything runs in ring 0. There are no processes, no syscalls, no ring 3.
+The main missing pieces are richer filesystem write paths, a real mount
+table, a `/dev` namespace, removable-media plumbing, and later FAT write
+support.
 
 ## Where We're Going
 
-The kernel boots, mounts KiFS as root, loads `/bin/init` as a ring 3
+The kernel boots, mounts KiFS as root, loads `/init` as a ring 3
 process. Init launches a shell. The shell launches programs. Everything
 in userspace communicates with the kernel through syscalls. A preemptive
 scheduler time-slices between processes. FAT support is added as a
@@ -20,6 +22,67 @@ secondary compatibility filesystem for removable media and easy file
 exchange with the host. KXE starts as a small, fixed-address native
 executable format, then grows features like relocations, integrity
 metadata, and better tooling once the basic userspace pipeline works.
+
+The storage/device model should converge on:
+- block devices discovered by drivers and registered with the kernel
+- a small devfs mounted at `/dev` exposing device nodes like `/dev/console`,
+  `/dev/disk0`, `/dev/disk0p1`, and later `/dev/usb0`
+- a VFS mount table that maps path prefixes to mounted filesystem
+  instances, so path resolution routes to the filesystem mounted on that
+  device or mountpoint
+- removable media treated the same way as fixed disks once a driver
+  presents them as block devices
+
+Current repo note: host-side KiFS copy tooling now supports directory
+destinations, so the normal image population path is `/bin/init`,
+`/bin/sh`, and `/bin/*`. Legacy root-level paths may still exist on older
+images, but they are compatibility fallback paths rather than the target
+layout.
+
+### Filesystem namespace model (target v1)
+
+Amendment:
+- `/home` is the single-user writable home directory for now
+- do not add `/root` until/unless real multi-user support creates a
+  concrete need for separate root-only and per-user home paths
+
+Keep the root filesystem intentionally small. The target KiFS layout
+should be:
+
+- `/bin` — all normal userspace executables
+- `/dev` — mountpoint for devfs, not regular KiFS files
+- `/mnt` — empty mountpoint tree for extra filesystems such as USB media
+- `/home` — the single-user writable home directory and default shell cwd
+- `/tmp` — scratch files
+
+For v1, do **not** add extra hierarchy unless a concrete need appears.
+That means no `/usr`, `/var`, `/proc`, `/sys`, `/lib`, `/sbin`, or
+`/users`.
+
+Single-user model:
+- there is only one real user for now: `root`
+- the home directory is `/home`
+- there is no `/users/root`
+- `/root` does not exist until/unless multi-user or privilege-separation
+  work actually needs it
+
+Executable placement:
+- `/bin/init` — first userspace process
+- `/bin/sh` — userspace shell
+- `/bin/ls`, `/bin/cat`, `/bin/stat`, etc. — normal utilities
+- `/bin/hello`, `/bin/filetest`, etc. — bring-up/test programs while
+  they still exist
+
+Mounting model:
+- KiFS is the normal root filesystem mounted at `/`
+- devfs mounts at `/dev`
+- removable or secondary filesystems mount under `/mnt/...`
+
+Migration note:
+- the current repo now prefers `/bin/init` at boot and populates
+  userspace programs under `/bin`
+- legacy fallbacks such as `/init` still exist in code only to keep older
+  disk images bootable during the transition
 
 ---
 
@@ -849,6 +912,13 @@ The userspace shell is a C program using kiwilib:
   - `./name` and `../name` use relative paths
   - `/path/name` uses the absolute path directly
 
+Practical repo note for now:
+- bare names should resolve from `/`
+- absolute paths like `/hello` work
+- relative paths and argv passing can come later
+- the userspace shell needs a minimal `spawn` + `waitpid` path so it can
+  launch programs without replacing itself
+
 The old kernel-shell `exec` command remains optional debug tooling, not
 the normal user-facing command syntax.
 
@@ -856,23 +926,42 @@ the normal user-facing command syntax.
 
 Instead of calling shell_loop(), kmain does:
 ```c
-process_t* init = kxe_load("/bin/init");
-// init launches /bin/shell
-run_first_process(init);
-scheduler_idle_loop(); // never returns
+process_t* init = kxe_load("/init");
+// /init launches /shell
+scheduler_run(init);
+// if userspace exits, optionally fall back to the kernel shell
 ```
 
 ### 12c. Init program
 
-/bin/init is dead simple for v0.1:
+`/init` is dead simple for v0.1:
 ```c
 int main(void) {
-    sys_exec("/bin/shell", NULL);
+    sys_exec("/shell");
     // If exec fails:
     sys_write(1, "init: failed to start shell\n", 28);
     return 1;
 }
 ```
+
+### 12d. Post-bring-up shell improvements (after Phase 13)
+
+Do not block preemption on shell polish. The first userspace shell only
+needs to prove the ring 3 boot path, stdin/stdout, and process launch
+flow. Once Phase 13 is in place, do a focused usability pass:
+
+- Add `./name` and `../name` path handling instead of only bare names and
+  absolute paths
+- Add command arguments once `spawn`/`exec` can build a real `argv` for
+  child processes
+- Move basic tools like `ls`, `cat`, and `stat` into userspace once a
+  directory-reading syscall exists
+- Improve line editing, history, and cursor movement once stdin/TTY input
+  can expose special keys cleanly to userspace
+- Add Ctrl+C / foreground-job behavior only after preemption and basic
+  job-control semantics exist
+
+Until then, the in-kernel shell can remain as a debug fallback.
 
 **How to verify:** Kernel boots, you see the shell prompt, type commands,
 everything works — but now it's all in ring 3.
@@ -936,6 +1025,49 @@ outb(0x40, (div >> 8) & 0xFF);
 
 **How to verify:** Run a program with an infinite loop. The shell still
 gets CPU time. Ctrl+C (once implemented) can kill the stuck program.
+
+---
+
+## Platform Workstream — ACPI + Platform Drivers
+
+**What:** Add ACPI table discovery/parsing and the first platform drivers
+that depend on it.
+
+**Why:** PIT-based bring-up can get you to preemption, but ACPI is the
+real platform description path for APIC routing, SMP discovery, clean
+shutdown/reboot, and better timer sources.
+
+### A1. RSDP/XSDT/RSDT discovery
+
+- Find RSDP from Limine or by scanning the EBDA/BIOS areas as fallback
+- Prefer XSDT on x86_64, keep RSDT support as fallback
+- Verify ACPI checksums before trusting any table
+
+### A2. MADT-backed interrupt drivers
+
+- Parse MADT entries for LAPIC, IOAPIC, and interrupt source overrides
+- Use this to replace legacy PIC-only interrupt routing over time
+- Keep PIC support as the early bring-up fallback
+
+### A3. FADT power-management hooks
+
+- Add clean reboot/shutdown support using FADT-derived reset/power info
+- This should replace QEMU-only or panic-only stop paths later
+
+### A4. HPET and future timer work
+
+- Parse HPET when present
+- Keep PIT as the initial scheduler timer, then move to HPET or LAPIC timer
+  once the interrupt routing path is stable
+
+### A5. Explicit non-goal for now
+
+- Full AML/ACPI namespace interpretation is not required yet
+- Start with fixed tables and platform-description data, not a whole ACPI VM
+
+**Suggested timing:** land this as a parallel platform track after the
+basic scheduler/userspace pipeline works, and before APIC/SMP/power
+features become a hard blocker.
 
 ---
 
@@ -1039,6 +1171,29 @@ Follow your spec's required ordering:
 Add write/create/mkdir/unlink to vnode_ops.
 Add sys_write for file FDs, sys_mkdir, sys_unlink syscalls.
 
+### 15e. Create the base KiFS directory tree
+
+Once KiFS can create directories, standardize new root images with:
+- `/bin`
+- `/dev`
+- `/mnt`
+- `/home`
+- `/tmp`
+
+Notes:
+- `/dev` and `/mnt` are mountpoints, even though they initially exist as
+  ordinary empty KiFS directories
+- `/home` is the only real home directory for now
+- `/root` is intentionally omitted until later multi-user work requires it
+- `/tmp` can stay simple; no special cleanup policy is required yet
+
+After that, migrate boot/user programs from root-level paths to:
+- `/bin/init`
+- `/bin/sh`
+- `/bin/hello`
+- `/bin/filetest`
+- etc.
+
 ---
 
 ## Phase 16 — Host-Side Disk Tooling
@@ -1054,9 +1209,9 @@ Similar to your in-kernel mkfs but operates on a raw file.
 
 Copies files into a KiFS partition in a disk image:
 ```bash
-./tools/kifs_cp disk.img --partition=1 hello.kxe /bin/hello
-./tools/kifs_cp disk.img --partition=1 shell.kxe /bin/shell
-./tools/kifs_cp disk.img --partition=1 init.kxe /bin/init
+./tools/kifs_cp disk.img --partition=1 hello.kxe /hello
+./tools/kifs_cp disk.img --partition=1 shell.kxe /shell
+./tools/kifs_cp disk.img --partition=1 init.kxe /init
 ```
 
 ### 16c. Build script integration
@@ -1064,32 +1219,174 @@ Copies files into a KiFS partition in a disk image:
 ```bash
 # compile.sh additions:
 make userspace          # builds all .kxe files
-tools/mkfs.kifs disk_gpt.img --partition=1 --inodes=1024
-tools/kifs_cp disk_gpt.img 1 userspace/bin/init /bin/init
-tools/kifs_cp disk_gpt.img 1 userspace/bin/shell /bin/shell
-tools/kifs_cp disk_gpt.img 1 userspace/bin/hello /bin/hello
+tools/mkfs.kifs disk.img --partition=1 --inodes=1024
+tools/kifs_mkdir disk.img 1 /bin
+tools/kifs_mkdir disk.img 1 /dev
+tools/kifs_mkdir disk.img 1 /mnt
+tools/kifs_mkdir disk.img 1 /home
+tools/kifs_mkdir disk.img 1 /tmp
+tools/kifs_cp disk.img 1 userspace/bin/init /bin/init
+tools/kifs_cp disk.img 1 userspace/bin/shell /bin/sh
+tools/kifs_cp disk.img 1 userspace/bin/hello /bin/hello
 ```
 
 ---
 
-## Phase 17 — Cleanup + Polish
+## Phase 17 — Device Namespace + Mount Table + Removable Media
+
+**What:** Add a proper device namespace, support more than one mounted
+filesystem at a time, and define how removable storage enters the
+system.
+
+**Why:** Right now the VFS only tracks one root mount. That is enough for
+bring-up, but not enough for `/dev`, `/mnt/usb`, or multiple disks. USB
+flash drives and future storage devices should look like ordinary block
+devices once discovered, and userspace needs a stable naming model for
+them.
+
+### 17a. Add devfs
+
+Add an in-memory device filesystem mounted at `/dev`.
+
+Initial device nodes:
+- `/dev/console` for stdin/stdout/stderr
+- `/dev/disk0`, `/dev/disk0p1`, `/dev/disk0p2`, etc. for block devices
+- optional aliases like `/dev/root`
+
+Later device nodes can include:
+- `/dev/tty0`
+- `/dev/input/kbd0`
+- `/dev/usb0` or bus-specific names if you add a USB stack
+
+The important point is not to copy Linux exactly. KiwiOS only needs a
+small, consistent device namespace. A minimal devfs is the right model.
+
+### 17b. Replace single-root mount state with a mount table
+
+Refactor the VFS so it no longer stores only one `g_root_mount`.
+
+Instead, maintain:
+- a root mount
+- additional mounts bound to absolute paths like `/mnt/usb`
+- path resolution that selects the correct mounted filesystem based on
+  the longest matching mount prefix
+
+This is the point where "routing to the right filesystem" becomes fully
+general. The routing decision is made when a device is mounted: the VFS
+probes the device, binds one filesystem driver instance to that mount,
+and future path lookups under that mountpoint go to that filesystem.
+
+### 17c. Block-device registration and mount workflow
+
+Formalize a kernel-side block-device registry.
+
+Each storage driver should register devices such as:
+- AHCI/SATA disks
+- GPT partitions
+- later USB mass-storage devices
+
+Userspace or the kernel shell can then:
+1. inspect `/dev`
+2. choose a block device node
+3. mount it on a target path
+
+If the target device contains KiFS, the KiFS driver should mount it. If
+it contains FAT, the FAT driver should mount it. The current probe-order
+model already points in this direction; this phase generalizes it beyond
+"one root mount only."
+
+### 17d. Removable media and USB mass storage
+
+When USB support exists, a USB mass-storage device should not require a
+special VFS path. It should become a normal block device, get a devfs
+node, and then be mounted like any other disk.
+
+That keeps layering clean:
+- USB stack discovers transport/device
+- block layer exposes a block device
+- VFS mounts a filesystem from that block device
+
+Do not mix "USB logic" into the filesystem layer.
+
+Current implementation note:
+- Phase 17 now has multi-disk block registration, devfs, mount-table
+  routing, userspace/kernel-shell mount workflows, and synthetic listing
+  of mounted child paths such as `/mnt/test`
+- USB mass storage exists as an initial UHCI/full-speed Bulk-Only
+  Transport driver; discovered devices become normal `/dev/diskN` and
+  `/dev/diskNpM` block devices
+- hotplug is currently detected by cheap USB polling from the scheduler
+  idle path and by `/dev`/mount lookups; full xHCI/EHCI support and safe
+  mounted-device removal are still future platform/storage work
+
+---
+
+## Phase 18 — FAT Write Support
+
+**What:** Add safe file and directory writes to FAT after KiFS writes and
+the mount/device model are stable.
+
+**Why:** FAT write support is useful for exchanging files with the host
+and with removable media, but it is a worse place to begin than KiFS
+because FAT allocation, directory updates, and crash behavior are less
+friendly for a new kernel.
+
+### 18a. Start with simple writable FAT operations
+
+Implement:
+- create
+- truncate/overwrite
+- mkdir
+- unlink/rmdir
+- cluster allocation and FAT chain extension
+- directory entry updates
+
+Long filename writes can follow after short-name write paths are solid.
+
+### 18b. Keep the write model conservative
+
+Prefer:
+- one writer at a time per vnode
+- synchronous metadata updates first
+- clear failure behavior over aggressive caching
+
+The goal is correctness and recoverability, not Linux-scale writeback.
+
+### 18c. Wire FAT writes into the same VFS/syscall surface
+
+Do not create FAT-specific syscalls.
+
+Instead, once FAT is writable, it should satisfy the same generic VFS
+operations as KiFS:
+- create
+- write
+- mkdir
+- unlink
+- rename later if needed
+
+That lets userspace tools operate on either filesystem through the same
+API.
+
+---
+
+## Phase 19 — Cleanup + Polish
 
 - Remove the in-kernel shell (or keep it as a debug fallback)
 - Proper sys_exit with parent notification
-- sys_waitpid so the shell can wait for child processes
+- Expand waitpid into full parent/child lifecycle and foreground job control
 - Signal-like mechanism for Ctrl+C (kill foreground process)
 - Error numbers (ENOENT, ENOMEM, etc.) instead of -1
 - /dev/console or similar for stdin/stdout
 
 ---
 
-## Phase 18 — KXE Improvements + Tooling Maturity
+## Phase 20 — KXE Improvements + Tooling Maturity
 
 **What:** Evolve KXE from a minimal static image format into a stronger
 long-term executable format for KiwiOS.
 
 **Why:** Phase 7 and Phase 8 only need the smallest loader-friendly
-design that gets `/bin/hello` and `/bin/init` running. Once that works,
+design that gets `/hello` and `/init` running. Once that works,
 KXE should grow carefully instead of staying permanently "good enough for
 bring-up."
 
@@ -1132,12 +1429,38 @@ Phase 11: Cooperative scheduler                 (2-3 hours)
 Phase 12: Userspace shell                       (2-3 hours)
           ──── MILESTONE: kernel only does setup, everything else is userspace ────
 Phase 13: Preemptive scheduling                 (2-3 hours)
+          Follow-up: userspace shell usability pass (path rules, argv, editing, core utilities)
 Phase 14: FAT support (read-only first)         (2-3 hours)
 Phase 15: KiFS write support                    (4-6 hours)
 Phase 16: Host-side disk tools                  (3-4 hours)
-Phase 17: Cleanup + polish                      (ongoing)
-Phase 18: KXE improvements + tooling maturity   (incremental, later)
+Phase 17: Device namespace + removable media    (3-5 hours, staged)
+Phase 18: FAT write support                     (4-6 hours)
+Phase 19: Cleanup + polish                      (ongoing)
+Phase 20: KXE improvements + tooling maturity   (incremental, later)
 ```
 
 The first real milestone is Phase 5. Everything before it is plumbing.
 Everything after it builds on a proven foundation.
+
+---
+
+## Remaining Work Snapshot
+
+Completed or substantially completed:
+- Phase 1 through Phase 13
+- Phase 14 in code, pending fuller runtime validation once a FAT test
+  partition is part of the normal workflow
+- Phase 17 — devfs, mount-table routing, multi-disk block registration,
+  userspace/kernel mount workflows, and initial UHCI USB mass-storage
+  hotplug
+
+Still to do:
+- [ ] Phase 15 — finish KiFS write paths and create the standard KiFS directory tree
+- [ ] Phase 16 — expand host-side tooling beyond file copy so the whole image lifecycle is handled from host tools
+- [ ] Phase 18 — add FAT write support on top of the generic VFS write API
+- [ ] Phase 19 — cleanup/polish, error codes, parent/child lifecycle, and console cleanup
+- [ ] Phase 20 — KXE maturation and better tooling
+
+Filesystem/layout migration still pending:
+- [ ] decide whether later multi-user support should keep `/home` as the
+  shared home namespace or introduce `/root` separately at that point

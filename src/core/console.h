@@ -1,6 +1,7 @@
 #ifndef CORE_CONSOLE_H
 #define CORE_CONSOLE_H
 
+#include <stdbool.h>
 #include <stdint.h>
 #include "limine.h"
 
@@ -11,6 +12,12 @@ void console_clear(void);
 void console_reset_scrollback(void);
 void console_clear_outputs(void);
 void console_render_visible(void);
+void console_set_input_line(const char *prefix,
+                            const char *text,
+                            uint32_t text_len,
+                            uint32_t cursor_pos,
+                            bool show_cursor);
+void console_timer_tick(void);
 
 void console_set_colors(uint32_t fg, uint32_t bg);
 void console_get_colors(uint32_t *fg, uint32_t *bg);

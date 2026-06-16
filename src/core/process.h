@@ -13,7 +13,8 @@ struct vnode;
 
 typedef struct {
     uint8_t used;
-    uint8_t reserved[7];
+    uint8_t reserved[3];
+    uint32_t flags;
     struct vnode* vnode;
     uint64_t offset;
 } process_fd_t;
@@ -26,39 +27,70 @@ typedef enum {
     PROC_ZOMBIE,
 } proc_state_t;
 
+typedef struct {
+    uint64_t rip;
+    uint64_t rsp;
+    uint64_t rflags;
+    uint64_t rax;
+    uint64_t rbx;
+    uint64_t rbp;
+    uint64_t rdi;
+    uint64_t rsi;
+    uint64_t rdx;
+    uint64_t rcx;
+    uint64_t r8;
+    uint64_t r9;
+    uint64_t r10;
+    uint64_t r11;
+    uint64_t r12;
+    uint64_t r13;
+    uint64_t r14;
+    uint64_t r15;
+} process_context_t;
+
+typedef struct {
+    uint64_t rsp;
+    uint64_t rip;
+    uint64_t rbx;
+    uint64_t rbp;
+    uint64_t r12;
+    uint64_t r13;
+    uint64_t r14;
+    uint64_t r15;
+    uint64_t cr3;
+    uint64_t rflags;
+} process_kernel_context_t;
+
+typedef enum {
+    PROC_RESUME_USER = 0,
+    PROC_RESUME_KERNEL,
+} process_resume_kind_t;
+
 typedef struct process {
     uint32_t pid;
     uint32_t ppid;
+    uint32_t wait_target_pid;
+    uint32_t exec_replaced_by_pid;
     char name[PROC_NAME_MAX];
     proc_state_t state;
     int32_t exit_code;
+    process_resume_kind_t resume_kind;
 
     page_table_t* page_table;
 
-    uint64_t saved_rip;
-    uint64_t saved_rsp;
-    uint64_t saved_rflags;
-    uint64_t saved_rax;
-    uint64_t saved_rbx;
-    uint64_t saved_rcx;
-    uint64_t saved_rdx;
-    uint64_t saved_rsi;
-    uint64_t saved_rdi;
-    uint64_t saved_rbp;
-    uint64_t saved_r8;
-    uint64_t saved_r9;
-    uint64_t saved_r10;
-    uint64_t saved_r11;
-    uint64_t saved_r12;
-    uint64_t saved_r13;
-    uint64_t saved_r14;
-    uint64_t saved_r15;
+    process_context_t context;
+    process_kernel_context_t kernel_context;
 
     uint64_t kernel_stack_phys;
     uint64_t kernel_stack_top;
 
     uint64_t brk_base;
     uint64_t brk_current;
+    uint64_t ticks_remaining;
+    uint8_t stdin_pending[4];
+    uint8_t stdin_pending_len;
+    uint8_t stdin_pending_pos;
+    uint8_t reserved0[2];
 
     process_fd_t fds[PROC_MAX_FDS];
 
@@ -71,13 +103,10 @@ process_t* process_current(void);
 process_t* process_by_pid(uint32_t pid);
 void process_set_name(process_t* proc, const char* name);
 void process_close_files(process_t* proc);
+void process_reap_zombies(void);
+bool process_has_blocked(void);
 bool process_map_user_stack(process_t* proc, uint64_t stack_top, uint32_t page_count);
 __attribute__((noreturn)) void process_enter(process_t* proc);
-
-/*
- * Temporary bring-up helper until scheduling/context switch code exists.
- * Phase 6 needs a notion of the current process before the scheduler lands.
- */
 void process_set_current(process_t* proc);
 
 #endif // CORE_PROCESS_H

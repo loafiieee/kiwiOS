@@ -684,22 +684,35 @@ static bool allocate_extents(kifs_image_t* fs, uint32_t need_blocks, kifs_extent
     return true;
 }
 
-static bool find_root_dir_block(const kifs_image_t* fs, uint32_t* out_block) {
-    kifs_inode_t root = {0};
+static bool inode_is_simple_dir(const kifs_inode_t* ino) {
+    return ino &&
+           magic_eq(ino->magic, KIFS_MAGIC_INODE) &&
+           ino->type == KIFS_INO_T_DIR &&
+           ino->extent_tree_height == 0 &&
+           ino->inline_extent_count > 0 &&
+           ino->inline_extents[0].file_block_start == 0 &&
+           ino->inline_extents[0].block_count > 0;
+}
+
+static bool find_dir_block(const kifs_image_t* fs, uint32_t dir_ino, uint32_t* out_block) {
+    kifs_inode_t dir = {0};
+    kifs_inode_t* dir_slot = NULL;
+
     if (!fs || !out_block) {
         return false;
     }
 
-    memcpy(&root, inode_ptr((kifs_image_t*)fs, fs->sb.root_ino), sizeof(root));
-    if (!magic_eq(root.magic, KIFS_MAGIC_INODE) || root.type != KIFS_INO_T_DIR || root.inline_extent_count == 0) {
+    dir_slot = inode_ptr((kifs_image_t*)fs, dir_ino);
+    if (!dir_slot) {
         return false;
     }
 
-    if (root.inline_extents[0].file_block_start != 0 || root.inline_extents[0].block_count == 0) {
+    memcpy(&dir, dir_slot, sizeof(dir));
+    if (!inode_is_simple_dir(&dir)) {
         return false;
     }
 
-    *out_block = root.inline_extents[0].disk_block_start;
+    *out_block = dir.inline_extents[0].disk_block_start;
     return true;
 }
 
@@ -753,31 +766,117 @@ static bool update_dir_checksum(kifs_image_t* fs, uint8_t dirblk[KIFS_BLOCK_SIZE
     return true;
 }
 
-static bool ensure_root_entry(kifs_image_t* fs, const char* name, uint32_t ino, bool overwrite_existing) {
+static bool scan_dir_inode(kifs_image_t* fs, uint32_t dir_ino, const char* name, dir_scan_t* out) {
+    uint8_t dirblk[KIFS_BLOCK_SIZE];
+    uint32_t dir_block = 0;
+
+    if (!find_dir_block(fs, dir_ino, &dir_block)) {
+        return false;
+    }
+
+    if (!read_block(fs, dir_block, dirblk) || !validate_shdr(dirblk, KIFS_MAGIC_DIR, KIFS_BTYPE_DIR, fs->meta_crc)) {
+        return false;
+    }
+
+    return scan_dir_block(dirblk, name, out);
+}
+
+static bool resolve_directory_path(kifs_image_t* fs, const char* dir_path, uint32_t* out_dir_ino) {
+    uint32_t current_ino = 0;
+    const char* cur = NULL;
+
+    if (!fs || !dir_path || dir_path[0] != '/' || !out_dir_ino) {
+        return false;
+    }
+
+    current_ino = fs->sb.root_ino;
+    if (dir_path[1] == '\0') {
+        *out_dir_ino = current_ino;
+        return true;
+    }
+
+    cur = dir_path + 1;
+    while (*cur) {
+        const char* comp = cur;
+        const char* next_sep = NULL;
+        kifs_inode_t* dir_slot = NULL;
+        char name[256];
+        size_t name_len = 0;
+        dir_scan_t scan;
+
+        while (*comp == '/') {
+            comp++;
+        }
+        if (*comp == '\0') {
+            break;
+        }
+
+        next_sep = strchr(comp, '/');
+        name_len = next_sep ? (size_t)(next_sep - comp) : strlen(comp);
+        if (name_len == 0 || name_len >= sizeof(name)) {
+            return false;
+        }
+
+        memcpy(name, comp, name_len);
+        name[name_len] = '\0';
+
+        if (!scan_dir_inode(fs, current_ino, name, &scan) || !scan.found) {
+            return false;
+        }
+
+        current_ino = scan.ino;
+        dir_slot = inode_ptr(fs, current_ino);
+        if (!inode_is_simple_dir(dir_slot)) {
+            return false;
+        }
+
+        if (!next_sep) {
+            break;
+        }
+        cur = next_sep + 1;
+    }
+
+    *out_dir_ino = current_ino;
+    return true;
+}
+
+static bool ensure_dir_entry(kifs_image_t* fs,
+                             uint32_t dir_ino,
+                             const char* name,
+                             uint32_t ino,
+                             uint8_t ftype,
+                             bool overwrite_existing) {
     uint8_t dirblk[KIFS_BLOCK_SIZE];
     dir_scan_t scan;
     uint32_t dir_block = 0;
     uint16_t new_reclen = 0;
 
-    if (!find_root_dir_block(fs, &dir_block)) {
-        fprintf(stderr, "kifs_cp: unsupported root directory layout\n");
+    if (!find_dir_block(fs, dir_ino, &dir_block)) {
+        fprintf(stderr, "kifs_cp: unsupported directory layout for inode %" PRIu32 "\n", dir_ino);
         return false;
     }
 
     if (!read_block(fs, dir_block, dirblk) || !validate_shdr(dirblk, KIFS_MAGIC_DIR, KIFS_BTYPE_DIR, fs->meta_crc)) {
-        fprintf(stderr, "kifs_cp: failed to read root directory block\n");
+        fprintf(stderr, "kifs_cp: failed to read directory inode %" PRIu32 "\n", dir_ino);
         return false;
     }
 
     scan_dir_block(dirblk, name, &scan);
     if (scan.found) {
-        if (!overwrite_existing || scan.ino != ino) {
+        if (!overwrite_existing) {
             return true;
         }
+
+        dir_write_entry(dirblk,
+                        scan.entry_off,
+                        ino,
+                        name,
+                        ftype,
+                        scan.entry_reclen);
     } else {
         new_reclen = dir_rec_len((uint8_t)strlen(name));
         if (scan.last_reclen < scan.last_min_reclen || (uint16_t)(scan.last_reclen - scan.last_min_reclen) < new_reclen) {
-            fprintf(stderr, "kifs_cp: root directory block is full\n");
+            fprintf(stderr, "kifs_cp: directory inode %" PRIu32 " is full\n", dir_ino);
             return false;
         }
 
@@ -786,13 +885,13 @@ static bool ensure_root_entry(kifs_image_t* fs, const char* name, uint32_t ino, 
                         scan.last_off + scan.last_min_reclen,
                         ino,
                         name,
-                        1,
+                        ftype,
                         (uint16_t)(scan.last_reclen - scan.last_min_reclen));
     }
 
     update_dir_checksum(fs, dirblk);
     if (!write_block(fs, dir_block, dirblk)) {
-        fprintf(stderr, "kifs_cp: failed to write root directory block\n");
+        fprintf(stderr, "kifs_cp: failed to write directory inode %" PRIu32 "\n", dir_ino);
         return false;
     }
 
@@ -862,22 +961,44 @@ static bool flush_metadata(kifs_image_t* fs) {
     return fflush(fs->fp) == 0;
 }
 
-static bool extract_root_name(const char* dst_path, char name_out[256]) {
-    size_t len = 0;
+static bool split_destination_path(const char* dst_path, char dir_out[256], char name_out[256]) {
+    const char* last_sep = NULL;
+    size_t dir_len = 0;
+    size_t name_len = 0;
+
     if (!dst_path || dst_path[0] != '/') {
         return false;
     }
-    if (dst_path[1] == '\0') {
+
+    if (strcmp(dst_path, "/") == 0) {
         return false;
     }
 
-    dst_path++;
-    len = strlen(dst_path);
-    if (len == 0 || len > 255 || strchr(dst_path, '/') != NULL) {
+    last_sep = strrchr(dst_path, '/');
+    if (!last_sep || last_sep[1] == '\0') {
         return false;
     }
 
-    memcpy(name_out, dst_path, len + 1u);
+    name_len = strlen(last_sep + 1);
+    if (name_len == 0 || name_len > 255) {
+        return false;
+    }
+
+    memcpy(name_out, last_sep + 1, name_len + 1u);
+
+    if (last_sep == dst_path) {
+        dir_out[0] = '/';
+        dir_out[1] = '\0';
+        return true;
+    }
+
+    dir_len = (size_t)(last_sep - dst_path);
+    if (dir_len >= 256) {
+        return false;
+    }
+
+    memcpy(dir_out, dst_path, dir_len);
+    dir_out[dir_len] = '\0';
     return true;
 }
 
@@ -885,7 +1006,13 @@ int main(int argc, char** argv) {
     kifs_image_t fs;
     uint8_t* src = NULL;
     size_t src_len = 0;
-    char root_name[256];
+    const char* disk_path = NULL;
+    const char* part_arg = NULL;
+    const char* src_path = NULL;
+    const char* dst_path = NULL;
+    char dir_path[256];
+    char file_name[256];
+    uint32_t parent_ino = 0;
     uint32_t ino = 0;
     bool new_inode = false;
     kifs_inode_t old_inode;
@@ -893,43 +1020,50 @@ int main(int argc, char** argv) {
     uint16_t extent_count = 0;
     kifs_inode_t* ino_slot = NULL;
     uint32_t need_blocks = 0;
-
+ 
     if (argc != 5) {
-        fprintf(stderr, "Usage: %s <disk.img> <partition_number> <src_file> </root_name>\n", argv[0]);
-        fprintf(stderr, "Example: %s disk_gpt.img 1 userspace/bin/hello /hello\n", argv[0]);
+        fprintf(stderr, "Usage: %s <disk.img> <partition_number> <src_file> <dest_path>\n", argv[0]);
+        fprintf(stderr, "Example: %s disk.img 1 userspace/bin/hello /bin/hello\n", argv[0]);
         return 1;
     }
 
-    if (!extract_root_name(argv[4], root_name)) {
-        fprintf(stderr, "kifs_cp: destination must be a root-level absolute path like /hello\n");
+    disk_path = argv[1];
+    part_arg = argv[2];
+    src_path = argv[3];
+    dst_path = argv[4];
+
+    if (!split_destination_path(dst_path, dir_path, file_name)) {
+        fprintf(stderr, "kifs_cp: destination must be an absolute file path like /bin/hello\n");
         return 1;
     }
 
-    if (!read_file(argv[3], &src, &src_len)) {
-        fprintf(stderr, "kifs_cp: failed to read source file %s\n", argv[3]);
+    if (!read_file(src_path, &src, &src_len)) {
+        fprintf(stderr, "kifs_cp: failed to read source file %s\n", src_path);
         return 1;
     }
 
-    if (!kifs_open_image(&fs, argv[1], (uint32_t)strtoul(argv[2], NULL, 10))) {
+    if (!kifs_open_image(&fs, disk_path, (uint32_t)strtoul(part_arg, NULL, 10))) {
+        free(src);
+        return 1;
+    }
+
+    if (!resolve_directory_path(&fs, dir_path, &parent_ino)) {
+        fprintf(stderr, "kifs_cp: destination directory %s does not exist or is unsupported\n", dir_path);
+        kifs_close_image(&fs);
         free(src);
         return 1;
     }
 
     {
-        uint8_t dirblk[KIFS_BLOCK_SIZE];
         dir_scan_t scan;
-        uint32_t dir_block = 0;
 
-        if (!find_root_dir_block(&fs, &dir_block) ||
-            !read_block(&fs, dir_block, dirblk) ||
-            !validate_shdr(dirblk, KIFS_MAGIC_DIR, KIFS_BTYPE_DIR, fs.meta_crc)) {
-            fprintf(stderr, "kifs_cp: failed to inspect root directory\n");
+        if (!scan_dir_inode(&fs, parent_ino, file_name, &scan)) {
+            fprintf(stderr, "kifs_cp: failed to inspect destination directory %s\n", dir_path);
             kifs_close_image(&fs);
             free(src);
             return 1;
         }
 
-        scan_dir_block(dirblk, root_name, &scan);
         if (scan.found) {
             ino = scan.ino;
         } else {
@@ -965,7 +1099,7 @@ int main(int argc, char** argv) {
 
     need_blocks = (uint32_t)((src_len + (KIFS_BLOCK_SIZE - 1u)) / KIFS_BLOCK_SIZE);
     if (!allocate_extents(&fs, need_blocks, extents, &extent_count)) {
-        fprintf(stderr, "kifs_cp: not enough free KiFS data blocks for %s\n", root_name);
+        fprintf(stderr, "kifs_cp: not enough free KiFS data blocks for %s\n", dst_path);
         kifs_close_image(&fs);
         free(src);
         return 1;
@@ -990,7 +1124,7 @@ int main(int argc, char** argv) {
 
     bitmap_set_mem(fs.inode_bitmap, fs.sb.inode_bitmap_blocks, ino);
 
-    if (!ensure_root_entry(&fs, root_name, ino, !new_inode)) {
+    if (!ensure_dir_entry(&fs, parent_ino, file_name, ino, KIFS_INO_T_FILE, !new_inode)) {
         kifs_close_image(&fs);
         free(src);
         return 1;
@@ -1003,7 +1137,7 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    printf("kifs_cp: copied %s to /%s (inode %" PRIu32 ", %zu bytes)\n", argv[3], root_name, ino, src_len);
+    printf("kifs_cp: copied %s to %s (inode %" PRIu32 ", %zu bytes)\n", src_path, dst_path, ino, src_len);
     kifs_close_image(&fs);
     free(src);
     return 0;

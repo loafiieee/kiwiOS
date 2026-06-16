@@ -23,7 +23,14 @@ static const fs_driver_t g_drivers[] = {
     { "fat",  fat_probe,  fat_mount  },
 };
 
-static vfs_mount_t* g_root_mount = NULL;
+#define VFS_MAX_MOUNTS 16u
+
+typedef struct {
+    bool used;
+    vfs_mount_t* mount;
+} vfs_mount_slot_t;
+
+static vfs_mount_slot_t g_mounts[VFS_MAX_MOUNTS];
 
 static block_device_t* pick_default_root_device(void) {
     uint32_t pc = block_partition_count();
@@ -34,32 +41,150 @@ static block_device_t* pick_default_root_device(void) {
 }
 
 void vfs_init(void) {
-    g_root_mount = NULL;
+    memset(g_mounts, 0, sizeof(g_mounts));
     log_ok("vfs", "VFS initialized");
 }
 
-vfs_mount_t* vfs_root_mount(void) {
-    return g_root_mount;
+static bool normalize_mount_path(const char* in, char* out, uint32_t out_cap) {
+    uint32_t len = 0;
+
+    if (!in || !out || out_cap < 2u || in[0] != '/') {
+        return false;
+    }
+
+    len = (uint32_t)strlen(in);
+    while (len > 1u && in[len - 1u] == '/') {
+        len--;
+    }
+
+    if ((len + 1u) > out_cap) {
+        return false;
+    }
+
+    memcpy(out, in, len);
+    out[len] = '\0';
+    return true;
 }
 
-static bool mount_with_driver(const fs_driver_t* d, block_device_t* dev) {
+static int find_mount_slot_exact(const char* normalized_path) {
+    for (uint32_t i = 0; i < VFS_MAX_MOUNTS; i++) {
+        if (!g_mounts[i].used || !g_mounts[i].mount) {
+            continue;
+        }
+        if (strcmp(g_mounts[i].mount->mount_path, normalized_path) == 0) {
+            return (int)i;
+        }
+    }
+    return -1;
+}
+
+static int find_mount_slot_available(const char* normalized_path) {
+    int exact = find_mount_slot_exact(normalized_path);
+    if (exact >= 0) {
+        return exact;
+    }
+
+    for (uint32_t i = 0; i < VFS_MAX_MOUNTS; i++) {
+        if (!g_mounts[i].used) {
+            return (int)i;
+        }
+    }
+
+    return -1;
+}
+
+static bool bind_mount_normalized(const char* normalized_path, vfs_mount_t* mount) {
+    int slot = 0;
+
+    if (!normalized_path || !mount || !mount->root) {
+        return false;
+    }
+
+    slot = find_mount_slot_available(normalized_path);
+    if (slot < 0) {
+        log_errorf("vfs", "No free mount slots for %s", normalized_path);
+        return false;
+    }
+
+    memset(mount->mount_path, 0, sizeof(mount->mount_path));
+    memcpy(mount->mount_path, normalized_path, strlen(normalized_path) + 1u);
+    mount->root->mount = mount;
+
+    g_mounts[slot].used = true;
+    g_mounts[slot].mount = mount;
+
+    log_okf("vfs", "Mounted %s on %s at %s (%s)",
+            mount->fs_name ? mount->fs_name : "(unknown)",
+            mount->dev && mount->dev->name ? mount->dev->name : "(pseudo)",
+            mount->mount_path,
+            mount->readonly ? "ro" : "rw");
+    return true;
+}
+
+bool vfs_bind_mount(const char* abs_path, vfs_mount_t* mount) {
+    char normalized[VFS_MAX_MOUNT_PATH];
+
+    if (!normalize_mount_path(abs_path, normalized, sizeof(normalized))) {
+        return false;
+    }
+
+    return bind_mount_normalized(normalized, mount);
+}
+
+vfs_mount_t* vfs_mount_at(const char* abs_path) {
+    char normalized[VFS_MAX_MOUNT_PATH];
+    int slot = 0;
+
+    if (!normalize_mount_path(abs_path, normalized, sizeof(normalized))) {
+        return NULL;
+    }
+
+    slot = find_mount_slot_exact(normalized);
+    if (slot < 0) {
+        return NULL;
+    }
+
+    return g_mounts[slot].mount;
+}
+
+vfs_mount_t* vfs_root_mount(void) {
+    return vfs_mount_at("/");
+}
+
+static bool mount_with_driver_at(const fs_driver_t* d,
+                                 const char* normalized_path,
+                                 block_device_t* dev) {
     vfs_mount_t* m = NULL;
+
     if (!d->mount(dev, &m) || !m) {
         return false;
     }
 
-    // Replace existing root mount (leak-safe: this OS has no unmount yet; free minimal).
-    g_root_mount = m;
-
-    log_okf("vfs", "Mounted %s on %s (%s)",
-            m->fs_name ? m->fs_name : d->name,
-            dev && dev->name ? dev->name : "(noname)",
-            m->readonly ? "ro" : "rw");
-    return true;
+    return bind_mount_normalized(normalized_path, m);
 }
 
-bool vfs_mount_root_dev(block_device_t* dev) {
+bool vfs_mount_dev(const char* abs_path, block_device_t* dev) {
+    char normalized[VFS_MAX_MOUNT_PATH];
+    vnode_t* target = NULL;
+
     if (!dev) return false;
+    if (!normalize_mount_path(abs_path, normalized, sizeof(normalized))) {
+        return false;
+    }
+    if (strcmp(normalized, "/") != 0) {
+        if (!vfs_resolve(normalized, &target) || !target || target->type != VNODE_DIR) {
+            if (target) {
+                vfs_vnode_put(target);
+            }
+            log_errorf("vfs", "Mount target %s is not an existing directory", normalized);
+            return false;
+        }
+        vfs_vnode_put(target);
+    }
+    if (find_mount_slot_available(normalized) < 0) {
+        log_errorf("vfs", "No free mount slots for %s", normalized);
+        return false;
+    }
 
     for (uint32_t i = 0; i < (sizeof(g_drivers) / sizeof(g_drivers[0])); i++) {
         const fs_driver_t* d = &g_drivers[i];
@@ -67,7 +192,7 @@ bool vfs_mount_root_dev(block_device_t* dev) {
 
         if (d->probe(dev)) {
             log_infof("vfs", "Probe matched: %s on %s", d->name, dev->name ? dev->name : "(noname)");
-            if (mount_with_driver(d, dev)) return true;
+            if (mount_with_driver_at(d, normalized, dev)) return true;
             log_errorf("vfs", "Mount failed for driver %s", d->name);
         }
     }
@@ -76,13 +201,17 @@ bool vfs_mount_root_dev(block_device_t* dev) {
     return false;
 }
 
+bool vfs_mount_root_dev(block_device_t* dev) {
+    return vfs_mount_dev("/", dev);
+}
+
 bool vfs_mount_root_auto(void) {
     block_device_t* dev = pick_default_root_device();
     if (!dev) {
         log_error("vfs", "No block device available for root mount");
         return false;
     }
-    return vfs_mount_root_dev(dev);
+    return vfs_mount_dev("/", dev);
 }
 
 static bool is_abs_path(const char* p) {
@@ -108,7 +237,284 @@ static const char* next_component(const char* p, char* out, uint32_t out_cap) {
     return p;
 }
 
+static bool split_parent_child(const char* abs_path,
+                               char* parent_out,
+                               uint32_t parent_cap,
+                               char* name_out,
+                               uint32_t name_cap) {
+    uint32_t len = 0;
+    uint32_t end = 0;
+    uint32_t slash = 0;
+    uint32_t name_len = 0;
+
+    if (!is_abs_path(abs_path) || !parent_out || !name_out || parent_cap < 2 || name_cap < 2) {
+        return false;
+    }
+
+    len = (uint32_t)strlen(abs_path);
+    if (len <= 1) {
+        return false;
+    }
+
+    end = len;
+    while (end > 1 && abs_path[end - 1] == '/') {
+        end--;
+    }
+    if (end <= 1) {
+        return false;
+    }
+
+    slash = end - 1u;
+    while (slash > 0 && abs_path[slash] != '/') {
+        slash--;
+    }
+    if (abs_path[slash] != '/') {
+        return false;
+    }
+
+    name_len = end - slash - 1u;
+    if (name_len == 0 || (name_len + 1u) > name_cap) {
+        return false;
+    }
+
+    memcpy(name_out, abs_path + slash + 1u, name_len);
+    name_out[name_len] = '\0';
+
+    if (strcmp(name_out, ".") == 0 || strcmp(name_out, "..") == 0) {
+        return false;
+    }
+
+    if (slash == 0) {
+        parent_out[0] = '/';
+        parent_out[1] = '\0';
+        return true;
+    }
+
+    if ((slash + 1u) > parent_cap) {
+        return false;
+    }
+
+    memcpy(parent_out, abs_path, slash);
+    parent_out[slash] = '\0';
+    return true;
+}
+
+static bool path_has_mount_prefix(const char* abs_path, const char* mount_path, uint32_t* out_len) {
+    uint32_t mount_len = 0;
+
+    if (!abs_path || !mount_path || mount_path[0] != '/') {
+        return false;
+    }
+
+    mount_len = (uint32_t)strlen(mount_path);
+    if (mount_len == 1u && mount_path[0] == '/') {
+        if (abs_path[0] != '/') {
+            return false;
+        }
+        if (out_len) {
+            *out_len = 1u;
+        }
+        return true;
+    }
+
+    if (strncmp(abs_path, mount_path, mount_len) != 0) {
+        return false;
+    }
+
+    if (abs_path[mount_len] != '\0' && abs_path[mount_len] != '/') {
+        return false;
+    }
+
+    if (out_len) {
+        *out_len = mount_len;
+    }
+    return true;
+}
+
+static vfs_mount_t* select_mount_for_path(const char* abs_path, const char** out_rel_path) {
+    vfs_mount_t* best = NULL;
+    uint32_t best_len = 0;
+
+    if (!abs_path || abs_path[0] != '/') {
+        return NULL;
+    }
+
+    for (uint32_t i = 0; i < VFS_MAX_MOUNTS; i++) {
+        uint32_t mount_len = 0;
+
+        if (!g_mounts[i].used || !g_mounts[i].mount) {
+            continue;
+        }
+
+        if (!path_has_mount_prefix(abs_path, g_mounts[i].mount->mount_path, &mount_len)) {
+            continue;
+        }
+
+        if (!best || mount_len > best_len) {
+            best = g_mounts[i].mount;
+            best_len = mount_len;
+        }
+    }
+
+    if (!best) {
+        return NULL;
+    }
+
+    if (out_rel_path) {
+        if (best_len == 1u) {
+            *out_rel_path = abs_path;
+        } else if (abs_path[best_len] == '\0') {
+            *out_rel_path = "/";
+        } else {
+            *out_rel_path = abs_path + best_len;
+        }
+    }
+
+    return best;
+}
+
+static vnode_t* clone_mount_root(vfs_mount_t* mount) {
+    vnode_t* root = NULL;
+
+    if (!mount || !mount->root) {
+        return NULL;
+    }
+
+    root = (vnode_t*)kmalloc(sizeof(vnode_t));
+    if (!root) {
+        return NULL;
+    }
+
+    *root = *mount->root;
+    return root;
+}
+
+static bool mount_direct_child_name(const char* dir_path,
+                                    const vfs_mount_t* mount,
+                                    char* out_name,
+                                    uint32_t out_cap) {
+    const char* rem = NULL;
+    uint32_t n = 0;
+
+    if (!dir_path || !mount || !out_name || out_cap < 2u) {
+        return false;
+    }
+
+    if (strcmp(dir_path, mount->mount_path) == 0) {
+        return false;
+    }
+
+    if (strcmp(dir_path, "/") == 0) {
+        if (mount->mount_path[0] != '/' || mount->mount_path[1] == '\0') {
+            return false;
+        }
+        rem = mount->mount_path + 1u;
+    } else {
+        uint32_t dir_len = (uint32_t)strlen(dir_path);
+        if (strncmp(mount->mount_path, dir_path, dir_len) != 0) {
+            return false;
+        }
+        if (mount->mount_path[dir_len] != '/') {
+            return false;
+        }
+        rem = mount->mount_path + dir_len + 1u;
+    }
+
+    if (!rem || *rem == '\0') {
+        return false;
+    }
+
+    while (rem[n] != '\0' && rem[n] != '/') {
+        if ((n + 1u) >= out_cap) {
+            return false;
+        }
+        out_name[n] = rem[n];
+        n++;
+    }
+
+    if (n == 0u) {
+        return false;
+    }
+
+    out_name[n] = '\0';
+    return true;
+}
+
+bool vfs_readdir(const char* abs_path, vfs_readdir_cb cb, void* user) {
+    char normalized[VFS_MAX_MOUNT_PATH];
+    vnode_t* dir = NULL;
+    char seen_mount_names[VFS_MAX_MOUNTS][256];
+    uint32_t seen_count = 0;
+
+    if (!cb || !normalize_mount_path(abs_path, normalized, sizeof(normalized))) {
+        return false;
+    }
+
+    if (!vfs_resolve(normalized, &dir) || !dir) {
+        return false;
+    }
+
+    if (dir->type != VNODE_DIR || !dir->ops || !dir->ops->readdir) {
+        vfs_vnode_put(dir);
+        return false;
+    }
+
+    if (!dir->ops->readdir(dir, cb, user)) {
+        vfs_vnode_put(dir);
+        return true;
+    }
+
+    for (uint32_t i = 0; i < VFS_MAX_MOUNTS; i++) {
+        char child_name[256];
+        bool duplicate_mount = false;
+
+        if (!g_mounts[i].used || !g_mounts[i].mount) {
+            continue;
+        }
+
+        if (!mount_direct_child_name(normalized, g_mounts[i].mount, child_name, sizeof(child_name))) {
+            continue;
+        }
+
+        for (uint32_t j = 0; j < seen_count; j++) {
+            if (strcmp(seen_mount_names[j], child_name) == 0) {
+                duplicate_mount = true;
+                break;
+            }
+        }
+        if (duplicate_mount) {
+            continue;
+        }
+
+        if (dir->ops->lookup) {
+            vnode_t* existing = NULL;
+            if (dir->ops->lookup(dir, child_name, &existing) && existing) {
+                vfs_vnode_put(existing);
+                continue;
+            }
+        }
+
+        if (seen_count < VFS_MAX_MOUNTS) {
+            memcpy(seen_mount_names[seen_count], child_name, strlen(child_name) + 1u);
+            seen_count++;
+        }
+
+        if (!cb(child_name,
+                g_mounts[i].mount->root ? g_mounts[i].mount->root->ino : 0u,
+                user)) {
+            vfs_vnode_put(dir);
+            return true;
+        }
+    }
+
+    vfs_vnode_put(dir);
+    return true;
+}
+
 bool vfs_resolve(const char* abs_path, vnode_t** out) {
+    vfs_mount_t* mount = NULL;
+    const char* rel_path = NULL;
+
     if (!out) return false;
     *out = NULL;
 
@@ -116,26 +522,22 @@ bool vfs_resolve(const char* abs_path, vnode_t** out) {
         return false;
     }
 
-    if (!g_root_mount || !g_root_mount->root) {
+    mount = select_mount_for_path(abs_path, &rel_path);
+    if (!mount || !mount->root) {
         return false;
     }
 
-    // Special case: "/"
-    if (strcmp(abs_path, "/") == 0) {
-        // Duplicate root vnode by asking driver to resolve inode again if possible.
-        // For now: shallow copy of vnode struct (safe because fs_private is immutable for v0.1).
-        vnode_t* r = (vnode_t*)kmalloc(sizeof(vnode_t));
-        if (!r) return false;
-        *r = *g_root_mount->root;
-        *out = r;
+    if (strcmp(rel_path, "/") == 0) {
+        vnode_t* root = clone_mount_root(mount);
+        if (!root) return false;
+        *out = root;
         return true;
     }
 
-    vnode_t* cur = (vnode_t*)kmalloc(sizeof(vnode_t));
+    vnode_t* cur = clone_mount_root(mount);
     if (!cur) return false;
-    *cur = *g_root_mount->root;
 
-    const char* p = abs_path;
+    const char* p = rel_path;
     char name[256];
 
     while (1) {
@@ -165,9 +567,116 @@ bool vfs_resolve(const char* abs_path, vnode_t** out) {
     return true;
 }
 
+bool vfs_create(const char* abs_path, uint32_t mode, vnode_t** out) {
+    char parent_path[256];
+    char name[256];
+    vnode_t* parent = NULL;
+    vnode_t* created = NULL;
+    bool ok = false;
+
+    if (out) {
+        *out = NULL;
+    }
+
+    if (!split_parent_child(abs_path, parent_path, sizeof(parent_path), name, sizeof(name))) {
+        return false;
+    }
+
+    if (!vfs_resolve(parent_path, &parent) || !parent) {
+        return false;
+    }
+
+    if (parent->mount && parent->mount->readonly) {
+        vfs_vnode_put(parent);
+        return false;
+    }
+
+    if (parent->type != VNODE_DIR || !parent->ops || !parent->ops->create) {
+        vfs_vnode_put(parent);
+        return false;
+    }
+
+    ok = parent->ops->create(parent, name, mode, &created);
+    vfs_vnode_put(parent);
+    if (!ok) {
+        if (created) {
+            vfs_vnode_put(created);
+        }
+        return false;
+    }
+
+    if (!out && created) {
+        vfs_vnode_put(created);
+    } else if (out) {
+        *out = created;
+    }
+
+    return true;
+}
+
+bool vfs_mkdir(const char* abs_path, uint32_t mode) {
+    char parent_path[256];
+    char name[256];
+    vnode_t* parent = NULL;
+    bool ok = false;
+
+    if (!split_parent_child(abs_path, parent_path, sizeof(parent_path), name, sizeof(name))) {
+        return false;
+    }
+
+    if (!vfs_resolve(parent_path, &parent) || !parent) {
+        return false;
+    }
+
+    if (parent->mount && parent->mount->readonly) {
+        vfs_vnode_put(parent);
+        return false;
+    }
+
+    if (parent->type != VNODE_DIR || !parent->ops || !parent->ops->mkdir) {
+        vfs_vnode_put(parent);
+        return false;
+    }
+
+    ok = parent->ops->mkdir(parent, name, mode);
+    vfs_vnode_put(parent);
+    return ok;
+}
+
+bool vfs_unlink(const char* abs_path) {
+    char parent_path[256];
+    char name[256];
+    vnode_t* parent = NULL;
+    bool ok = false;
+
+    if (!split_parent_child(abs_path, parent_path, sizeof(parent_path), name, sizeof(name))) {
+        return false;
+    }
+
+    if (!vfs_resolve(parent_path, &parent) || !parent) {
+        return false;
+    }
+
+    if (parent->mount && parent->mount->readonly) {
+        vfs_vnode_put(parent);
+        return false;
+    }
+
+    if (parent->type != VNODE_DIR || !parent->ops || !parent->ops->unlink) {
+        vfs_vnode_put(parent);
+        return false;
+    }
+
+    ok = parent->ops->unlink(parent, name);
+    vfs_vnode_put(parent);
+    return ok;
+}
+
 void vfs_vnode_put(vnode_t* vn) {
     if (!vn) return;
+    if (vn->ops && vn->ops->release) {
+        vn->ops->release(vn);
+    }
     // In v0.1 we allocate vnodes with kmalloc and do not maintain refcounts.
     kfree(vn);
 }
-

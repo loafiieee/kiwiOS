@@ -26,6 +26,16 @@ typedef struct {
     bool meta_crc;
 } kifs_fs_t;
 
+static const vnode_ops_t g_kifs_vops;
+
+#define KIFS_BITMAP_PAYLOAD_BYTES (KIFS_BLOCK_SIZE - (uint32_t)sizeof(kifs_shdr_t))
+#define KIFS_BITMAP_BITS_PER_BLOCK (KIFS_BITMAP_PAYLOAD_BYTES * 8u)
+
+static void init_dir_block(uint8_t* out_blk, uint32_t parent_hint, bool with_crc);
+static uint16_t dir_rec_len(uint8_t name_len);
+static void dir_write_ent(uint8_t* blk, uint32_t off, uint32_t ino, const char* name, uint8_t ftype, uint16_t rec_len);
+static void inode_zero(kifs_inode_t* i);
+
 // ---------------- utilities ----------------
 
 static inline uint32_t u32_min(uint32_t a, uint32_t b) { return a < b ? a : b; }
@@ -464,6 +474,643 @@ static bool dir_iterate(const kifs_fs_t* fs, const kifs_inode_t* dir_ino, vfs_re
     return true;
 }
 
+typedef struct {
+    bool found;
+    uint32_t ino;
+    uint32_t entry_off;
+    uint16_t entry_reclen;
+    bool prev_valid;
+    uint32_t prev_off;
+    uint16_t prev_reclen;
+    uint16_t prev_min_reclen;
+    bool slot_valid;
+    uint32_t slot_off;
+    uint16_t slot_reclen;
+    uint16_t slot_min_reclen;
+} kifs_dir_scan_t;
+
+typedef struct {
+    bool empty;
+} dir_empty_ctx_t;
+
+static bool dir_empty_cb(const char* name, uint32_t ino, void* user) {
+    dir_empty_ctx_t* ctx = (dir_empty_ctx_t*)user;
+
+    if (!ctx || ino == 0) {
+        return true;
+    }
+
+    if (strcmp(name, ".") == 0 || strcmp(name, "..") == 0) {
+        return true;
+    }
+
+    ctx->empty = false;
+    return false;
+}
+
+static void structured_rechecksum(uint8_t* blk, bool with_crc) {
+    kifs_shdr_t* h = (kifs_shdr_t*)blk;
+
+    h->checksum = 0;
+    if (with_crc) {
+        h->checksum = crc32_ieee(blk, KIFS_BLOCK_SIZE);
+    }
+}
+
+static bool bitmap_payload_get(const uint8_t* payload, uint32_t bit) {
+    return (payload[bit / 8u] & (uint8_t)(1u << (bit % 8u))) != 0;
+}
+
+static void bitmap_payload_set(uint8_t* payload, uint32_t bit) {
+    payload[bit / 8u] |= (uint8_t)(1u << (bit % 8u));
+}
+
+static void bitmap_payload_clear(uint8_t* payload, uint32_t bit) {
+    payload[bit / 8u] &= (uint8_t)~(1u << (bit % 8u));
+}
+
+static bool bitmap_access(const kifs_fs_t* fs,
+                          bool inode_bitmap,
+                          uint32_t bit_index,
+                          bool* out_value,
+                          bool update_value,
+                          bool new_value) {
+    uint32_t start = inode_bitmap ? fs->sb.inode_bitmap_start : fs->sb.block_bitmap_start;
+    uint32_t blocks = inode_bitmap ? fs->sb.inode_bitmap_blocks : fs->sb.block_bitmap_blocks;
+    const char* magic = inode_bitmap ? KIFS_MAGIC_IMB : KIFS_MAGIC_BMB;
+    uint16_t btype = inode_bitmap ? KIFS_BTYPE_IMB : KIFS_BTYPE_BMB;
+    uint32_t bi = bit_index / KIFS_BITMAP_BITS_PER_BLOCK;
+    uint32_t bit = bit_index % KIFS_BITMAP_BITS_PER_BLOCK;
+    bcache_buf_t* b = NULL;
+    uint8_t* blk = NULL;
+    uint8_t* payload = NULL;
+
+    if (!fs || bi >= blocks) {
+        return false;
+    }
+
+    b = bcache_get(fs->dev, start + bi);
+    if (!b) {
+        return false;
+    }
+
+    blk = (uint8_t*)bcache_data(b);
+    if (!validate_shdr(blk, magic, btype, fs->meta_crc)) {
+        bcache_put(b);
+        return false;
+    }
+
+    payload = blk + sizeof(kifs_shdr_t);
+    if (out_value) {
+        *out_value = bitmap_payload_get(payload, bit);
+    }
+
+    if (update_value) {
+        if (new_value) {
+            bitmap_payload_set(payload, bit);
+        } else {
+            bitmap_payload_clear(payload, bit);
+        }
+        structured_rechecksum(blk, fs->meta_crc);
+        bcache_mark_dirty(b);
+    }
+
+    bcache_put(b);
+    return true;
+}
+
+static bool bitmap_alloc_range(const kifs_fs_t* fs,
+                               bool inode_bitmap,
+                               uint32_t start_bit,
+                               uint32_t end_bit,
+                               uint32_t* out_bit) {
+    for (uint32_t bit = start_bit; bit < end_bit; bit++) {
+        bool used = false;
+
+        if (!bitmap_access(fs, inode_bitmap, bit, &used, false, false)) {
+            return false;
+        }
+        if (used) {
+            continue;
+        }
+
+        if (!bitmap_access(fs, inode_bitmap, bit, NULL, true, true)) {
+            return false;
+        }
+
+        if (out_bit) {
+            *out_bit = bit;
+        }
+        return true;
+    }
+
+    return false;
+}
+
+static bool inode_alloc(const kifs_fs_t* fs, uint32_t* out_ino) {
+    return bitmap_alloc_range(fs, true, 1, fs->sb.inode_count, out_ino);
+}
+
+static bool data_block_alloc(const kifs_fs_t* fs, uint32_t* out_blk) {
+    return bitmap_alloc_range(fs, false, fs->data_start, fs->data_end, out_blk);
+}
+
+static void inode_free(const kifs_fs_t* fs, uint32_t ino_num) {
+    (void)bitmap_access(fs, true, ino_num, NULL, true, false);
+}
+
+static void data_block_free(const kifs_fs_t* fs, uint32_t blkno) {
+    (void)bitmap_access(fs, false, blkno, NULL, true, false);
+}
+
+static bool inode_write(const kifs_fs_t* fs, uint32_t ino_num, const kifs_inode_t* in) {
+    uint32_t block = 0;
+    uint32_t off = 0;
+    bcache_buf_t* b = NULL;
+    uint8_t* dst = NULL;
+
+    if (!fs || !in || ino_num == 0 || ino_num >= fs->sb.inode_count) {
+        return false;
+    }
+
+    block = fs->sb.inode_table_start + (ino_num / 16u);
+    off = (ino_num % 16u) * sizeof(kifs_inode_t);
+
+    b = bcache_get(fs->dev, block);
+    if (!b) {
+        return false;
+    }
+
+    dst = ((uint8_t*)bcache_data(b)) + off;
+    memcpy(dst, in, sizeof(*in));
+    bcache_mark_dirty(b);
+    bcache_put(b);
+    return true;
+}
+
+static bool inode_clear(const kifs_fs_t* fs, uint32_t ino_num) {
+    kifs_inode_t zeroed;
+    memset(&zeroed, 0, sizeof(zeroed));
+    return inode_write(fs, ino_num, &zeroed);
+}
+
+static bool vnode_from_inode(vfs_mount_t* mount, uint32_t ino_num, vnode_t** out) {
+    kifs_fs_t* fs = NULL;
+    kifs_inode_t ino;
+    vnode_t* vn = NULL;
+
+    if (!mount || !mount->fs_private || !out) {
+        return false;
+    }
+
+    *out = NULL;
+    fs = (kifs_fs_t*)mount->fs_private;
+    if (!inode_read(fs, ino_num, &ino)) {
+        return false;
+    }
+
+    vn = (vnode_t*)kmalloc(sizeof(vnode_t));
+    if (!vn) {
+        return false;
+    }
+
+    memset(vn, 0, sizeof(*vn));
+    vn->mount = mount;
+    vn->ino = ino_num;
+    vn->type = (ino.type == KIFS_INO_T_DIR) ? VNODE_DIR : VNODE_FILE;
+    vn->size = ino.size_bytes;
+    vn->ops = &g_kifs_vops;
+
+    *out = vn;
+    return true;
+}
+
+static bool kifs_name_valid(const char* name) {
+    uint32_t len = 0;
+
+    if (!name || !name[0]) {
+        return false;
+    }
+
+    while (name[len]) {
+        if (name[len] == '/' || len >= 255u) {
+            return false;
+        }
+        len++;
+    }
+
+    return strcmp(name, ".") != 0 && strcmp(name, "..") != 0;
+}
+
+static bool scan_dir_block_mutable(const uint8_t* blk, const char* name, uint16_t need_rec_len, kifs_dir_scan_t* out) {
+    const kifs_shdr_t* h = (const kifs_shdr_t*)blk;
+    uint32_t off = 0;
+    uint32_t end = 0;
+    bool prev_valid = false;
+    uint32_t prev_off = 0;
+    uint16_t prev_reclen = 0;
+    uint16_t prev_min_reclen = 0;
+
+    if (!out) {
+        return false;
+    }
+
+    memset(out, 0, sizeof(*out));
+    off = h->header_bytes;
+    end = h->header_bytes + h->payload_bytes;
+
+    while (off + 8u <= end) {
+        const uint8_t* p = blk + off;
+        uint32_t ino = *(const uint32_t*)(p + 0);
+        uint16_t reclen = *(const uint16_t*)(p + 4);
+        uint8_t namelen = *(const uint8_t*)(p + 6);
+        uint16_t min_rec = dir_rec_len(namelen);
+
+        if (reclen < min_rec || (reclen & 7u) != 0 || off + reclen > end) {
+            break;
+        }
+
+        if (ino != 0) {
+            char cur_name[256];
+            memcpy(cur_name, p + 8, namelen);
+            cur_name[namelen] = '\0';
+
+            if (!out->slot_valid &&
+                need_rec_len != 0 &&
+                reclen >= min_rec &&
+                (uint16_t)(reclen - min_rec) >= need_rec_len) {
+                out->slot_valid = true;
+                out->slot_off = off;
+                out->slot_reclen = reclen;
+                out->slot_min_reclen = min_rec;
+            }
+
+            if (name && strcmp(cur_name, name) == 0) {
+                out->found = true;
+                out->ino = ino;
+                out->entry_off = off;
+                out->entry_reclen = reclen;
+                out->prev_valid = prev_valid;
+                out->prev_off = prev_off;
+                out->prev_reclen = prev_reclen;
+                out->prev_min_reclen = prev_min_reclen;
+                return true;
+            }
+
+            prev_valid = true;
+            prev_off = off;
+            prev_reclen = reclen;
+            prev_min_reclen = min_rec;
+        }
+
+        off += reclen;
+    }
+
+    return true;
+}
+
+static bool dir_add_entry(const kifs_fs_t* fs,
+                          const kifs_inode_t* dir_ino,
+                          const char* name,
+                          uint32_t child_ino,
+                          uint8_t ftype) {
+    uint64_t size = 0;
+    uint32_t nblocks = 0;
+    uint16_t need_rec = 0;
+
+    if (!fs || !dir_ino || dir_ino->type != KIFS_INO_T_DIR || !kifs_name_valid(name)) {
+        return false;
+    }
+
+    need_rec = dir_rec_len((uint8_t)strlen(name));
+    size = dir_ino->size_bytes;
+    nblocks = (uint32_t)((size + (KIFS_BLOCK_SIZE - 1u)) / KIFS_BLOCK_SIZE);
+
+    for (uint32_t file_blk = 0; file_blk < nblocks; file_blk++) {
+        uint32_t disk_blk = 0;
+        bcache_buf_t* b = NULL;
+        uint8_t* blk = NULL;
+        kifs_dir_scan_t scan;
+
+        if (!map_file_block(fs, dir_ino, file_blk, &disk_blk)) {
+            continue;
+        }
+
+        b = bcache_get(fs->dev, disk_blk);
+        if (!b) {
+            continue;
+        }
+
+        blk = (uint8_t*)bcache_data(b);
+        if (!validate_shdr(blk, KIFS_MAGIC_DIR, KIFS_BTYPE_DIR, fs->meta_crc)) {
+            bcache_put(b);
+            continue;
+        }
+
+        if (!scan_dir_block_mutable(blk, name, need_rec, &scan)) {
+            bcache_put(b);
+            return false;
+        }
+
+        if (scan.found) {
+            bcache_put(b);
+            return false;
+        }
+
+        if (!scan.slot_valid) {
+            bcache_put(b);
+            continue;
+        }
+
+        *(uint16_t*)(blk + scan.slot_off + 4u) = scan.slot_min_reclen;
+        dir_write_ent(blk,
+                      scan.slot_off + scan.slot_min_reclen,
+                      child_ino,
+                      name,
+                      ftype,
+                      (uint16_t)(scan.slot_reclen - scan.slot_min_reclen));
+        structured_rechecksum(blk, fs->meta_crc);
+        bcache_mark_dirty(b);
+        bcache_put(b);
+        return true;
+    }
+
+    return false;
+}
+
+static bool dir_remove_entry(const kifs_fs_t* fs, const kifs_inode_t* dir_ino, const char* name, uint32_t* out_ino) {
+    uint64_t size = 0;
+    uint32_t nblocks = 0;
+
+    if (!fs || !dir_ino || dir_ino->type != KIFS_INO_T_DIR || !kifs_name_valid(name)) {
+        return false;
+    }
+
+    size = dir_ino->size_bytes;
+    nblocks = (uint32_t)((size + (KIFS_BLOCK_SIZE - 1u)) / KIFS_BLOCK_SIZE);
+
+    for (uint32_t file_blk = 0; file_blk < nblocks; file_blk++) {
+        uint32_t disk_blk = 0;
+        bcache_buf_t* b = NULL;
+        uint8_t* blk = NULL;
+        kifs_dir_scan_t scan;
+
+        if (!map_file_block(fs, dir_ino, file_blk, &disk_blk)) {
+            continue;
+        }
+
+        b = bcache_get(fs->dev, disk_blk);
+        if (!b) {
+            continue;
+        }
+
+        blk = (uint8_t*)bcache_data(b);
+        if (!validate_shdr(blk, KIFS_MAGIC_DIR, KIFS_BTYPE_DIR, fs->meta_crc)) {
+            bcache_put(b);
+            continue;
+        }
+
+        if (!scan_dir_block_mutable(blk, name, 0, &scan)) {
+            bcache_put(b);
+            return false;
+        }
+
+        if (!scan.found) {
+            bcache_put(b);
+            continue;
+        }
+
+        if (!scan.prev_valid) {
+            bcache_put(b);
+            return false;
+        }
+
+        *(uint16_t*)(blk + scan.prev_off + 4u) = (uint16_t)(scan.prev_reclen + scan.entry_reclen);
+        structured_rechecksum(blk, fs->meta_crc);
+        bcache_mark_dirty(b);
+        bcache_put(b);
+
+        if (out_ino) {
+            *out_ino = scan.ino;
+        }
+        return true;
+    }
+
+    return false;
+}
+
+static bool dir_is_empty(const kifs_fs_t* fs, const kifs_inode_t* dir_ino) {
+    dir_empty_ctx_t ctx = { .empty = true };
+
+    if (!fs || !dir_ino || dir_ino->type != KIFS_INO_T_DIR) {
+        return false;
+    }
+
+    (void)dir_iterate(fs, dir_ino, dir_empty_cb, &ctx);
+    return ctx.empty;
+}
+
+static bool allocate_extents(const kifs_fs_t* fs, uint32_t need_blocks, kifs_extent_t out_extents[8], uint16_t* out_count) {
+    uint32_t remaining = need_blocks;
+    uint32_t current_start = 0;
+    uint32_t current_len = 0;
+    uint32_t current_file_block = 0;
+    uint16_t ext_count = 0;
+
+    if (!fs || !out_extents || !out_count) {
+        return false;
+    }
+
+    memset(out_extents, 0, sizeof(kifs_extent_t) * 8u);
+    *out_count = 0;
+
+    if (need_blocks == 0) {
+        return true;
+    }
+
+    for (uint32_t blk = fs->data_start; blk < fs->data_end && remaining > 0; blk++) {
+        bool used = false;
+
+        if (!bitmap_access(fs, false, blk, &used, false, false)) {
+            return false;
+        }
+
+        if (used) {
+            if (current_len != 0) {
+                if (ext_count >= 8u) {
+                    return false;
+                }
+                out_extents[ext_count].file_block_start = current_file_block;
+                out_extents[ext_count].disk_block_start = current_start;
+                out_extents[ext_count].block_count = current_len;
+                current_file_block += current_len;
+                ext_count++;
+                current_len = 0;
+            }
+            continue;
+        }
+
+        if (current_len == 0) {
+            current_start = blk;
+            current_len = 1;
+        } else if (blk == current_start + current_len) {
+            current_len++;
+        } else {
+            if (ext_count >= 8u) {
+                return false;
+            }
+            out_extents[ext_count].file_block_start = current_file_block;
+            out_extents[ext_count].disk_block_start = current_start;
+            out_extents[ext_count].block_count = current_len;
+            current_file_block += current_len;
+            ext_count++;
+            current_start = blk;
+            current_len = 1;
+        }
+
+        remaining--;
+    }
+
+    if (current_len != 0) {
+        if (ext_count >= 8u) {
+            return false;
+        }
+        out_extents[ext_count].file_block_start = current_file_block;
+        out_extents[ext_count].disk_block_start = current_start;
+        out_extents[ext_count].block_count = current_len;
+        ext_count++;
+    }
+
+    if (remaining != 0) {
+        return false;
+    }
+
+    for (uint16_t i = 0; i < ext_count; i++) {
+        for (uint32_t j = 0; j < out_extents[i].block_count; j++) {
+            if (!bitmap_access(fs, false, out_extents[i].disk_block_start + j, NULL, true, true)) {
+                for (uint16_t ri = 0; ri <= i; ri++) {
+                    uint32_t rollback_count = (ri == i) ? j : out_extents[ri].block_count;
+                    for (uint32_t rj = 0; rj < rollback_count; rj++) {
+                        data_block_free(fs, out_extents[ri].disk_block_start + rj);
+                    }
+                }
+                return false;
+            }
+        }
+    }
+
+    *out_count = ext_count;
+    return true;
+}
+
+static void free_inode_data(const kifs_fs_t* fs, const kifs_inode_t* ino) {
+    if (!fs || !ino || ino->extent_tree_height != 0) {
+        return;
+    }
+
+    for (uint16_t i = 0; i < ino->inline_extent_count && i < 8u; i++) {
+        const kifs_extent_t* e = &ino->inline_extents[i];
+        for (uint32_t j = 0; j < e->block_count; j++) {
+            data_block_free(fs, e->disk_block_start + j);
+        }
+    }
+}
+
+static void free_extent_array(const kifs_fs_t* fs, const kifs_extent_t* extents, uint16_t count) {
+    if (!fs || !extents) {
+        return;
+    }
+
+    for (uint16_t i = 0; i < count; i++) {
+        for (uint32_t j = 0; j < extents[i].block_count; j++) {
+            data_block_free(fs, extents[i].disk_block_start + j);
+        }
+    }
+}
+
+static bool write_extent_data(const kifs_fs_t* fs,
+                              const uint8_t* data,
+                              uint64_t len,
+                              const kifs_extent_t* extents,
+                              uint16_t extent_count) {
+    uint64_t written = 0;
+
+    for (uint16_t i = 0; i < extent_count; i++) {
+        for (uint32_t j = 0; j < extents[i].block_count; j++) {
+            bcache_buf_t* b = bcache_get(fs->dev, extents[i].disk_block_start + j);
+            uint8_t* blk = NULL;
+            uint64_t chunk = 0;
+
+            if (!b) {
+                return false;
+            }
+
+            blk = (uint8_t*)bcache_data(b);
+            memset(blk, 0, KIFS_BLOCK_SIZE);
+
+            chunk = len - written;
+            if (chunk > KIFS_BLOCK_SIZE) {
+                chunk = KIFS_BLOCK_SIZE;
+            }
+            if (chunk > 0 && data) {
+                memcpy(blk, data + written, (size_t)chunk);
+                written += chunk;
+            }
+
+            bcache_mark_dirty(b);
+            bcache_put(b);
+        }
+    }
+
+    return true;
+}
+
+static bool replace_file_contents(const kifs_fs_t* fs,
+                                  vnode_t* vn,
+                                  const kifs_inode_t* old_ino,
+                                  const uint8_t* data,
+                                  uint64_t len) {
+    kifs_extent_t new_extents[8];
+    uint16_t new_extent_count = 0;
+    kifs_inode_t new_ino;
+    uint32_t need_blocks = (uint32_t)((len + (KIFS_BLOCK_SIZE - 1u)) / KIFS_BLOCK_SIZE);
+
+    if (!fs || !vn || !old_ino || old_ino->type != KIFS_INO_T_FILE || old_ino->extent_tree_height != 0) {
+        return false;
+    }
+
+    memset(new_extents, 0, sizeof(new_extents));
+    if (!allocate_extents(fs, need_blocks, new_extents, &new_extent_count)) {
+        return false;
+    }
+
+    if (!write_extent_data(fs, data, len, new_extents, new_extent_count)) {
+        free_extent_array(fs, new_extents, new_extent_count);
+        return false;
+    }
+
+    new_ino = *old_ino;
+    new_ino.size_bytes = len;
+    new_ino.inline_extent_count = new_extent_count;
+    new_ino.extent_tree_height = 0;
+    new_ino.extent_tree_root = 0;
+    new_ino.mtime = old_ino->mtime + 1u;
+    new_ino.ctime = old_ino->ctime + 1u;
+    memset(new_ino.inline_extents, 0, sizeof(new_ino.inline_extents));
+    for (uint16_t i = 0; i < new_extent_count; i++) {
+        new_ino.inline_extents[i] = new_extents[i];
+    }
+
+    if (!inode_write(fs, vn->ino, &new_ino)) {
+        free_extent_array(fs, new_extents, new_extent_count);
+        return false;
+    }
+
+    free_inode_data(fs, old_ino);
+    vn->size = len;
+    return true;
+}
+
 // ---------------- VFS vnode ops ----------------
 
 static bool kifs_vnode_stat(vnode_t* vn, vfs_stat_t* out) {
@@ -498,25 +1145,7 @@ static bool kifs_vnode_lookup(vnode_t* dir, const char* name, vnode_t** out) {
     dir_iterate(fs, &din, dir_lookup_cb, &ctx);
     if (!ctx.found) return false;
 
-    vnode_t* vn = (vnode_t*)kmalloc(sizeof(vnode_t));
-    if (!vn) return false;
-    memset(vn, 0, sizeof(*vn));
-    vn->mount = dir->mount;
-    vn->ino = ctx.found_ino;
-
-    // Fill basic type/size
-    kifs_inode_t fin = {0};
-    if (!inode_read(fs, vn->ino, &fin)) {
-        kfree(vn);
-        return false;
-    }
-
-    vn->type = (fin.type == KIFS_INO_T_DIR) ? VNODE_DIR : VNODE_FILE;
-    vn->size = fin.size_bytes;
-    vn->ops = dir->ops;
-
-    *out = vn;
-    return true;
+    return vnode_from_inode(dir->mount, ctx.found_ino, out);
 }
 
 static bool kifs_vnode_readdir(vnode_t* dir, vfs_readdir_cb cb, void* user) {
@@ -574,10 +1203,308 @@ static int64_t kifs_vnode_read(vnode_t* vn, uint64_t offset, void* buf, uint64_t
     return (int64_t)done;
 }
 
+static bool kifs_vnode_truncate(vnode_t* vn, uint64_t size) {
+    kifs_fs_t* fs = NULL;
+    kifs_inode_t ino;
+    uint8_t* tmp = NULL;
+    uint64_t keep = 0;
+    bool ok = false;
+
+    if (!vn || !vn->mount || !vn->mount->fs_private) {
+        return false;
+    }
+
+    fs = (kifs_fs_t*)vn->mount->fs_private;
+    if (fs->readonly || !inode_read(fs, vn->ino, &ino) || ino.type != KIFS_INO_T_FILE) {
+        return false;
+    }
+
+    if (size == ino.size_bytes) {
+        return true;
+    }
+
+    if (size != 0) {
+        tmp = (uint8_t*)kmalloc((size_t)size);
+        if (!tmp) {
+            return false;
+        }
+        memset(tmp, 0, (size_t)size);
+
+        keep = u64_min(size, ino.size_bytes);
+        if (keep != 0 && kifs_vnode_read(vn, 0, tmp, keep) != (int64_t)keep) {
+            kfree(tmp);
+            return false;
+        }
+    }
+
+    ok = replace_file_contents(fs, vn, &ino, tmp, size) && bcache_sync_dev(fs->dev);
+    if (tmp) {
+        kfree(tmp);
+    }
+
+    return ok;
+}
+
+static int64_t kifs_vnode_write(vnode_t* vn, uint64_t offset, const void* buf, uint64_t len) {
+    kifs_fs_t* fs = NULL;
+    kifs_inode_t ino;
+    uint8_t* tmp = NULL;
+    uint64_t new_size = 0;
+    bool ok = false;
+
+    if (!vn || (!buf && len != 0) || !vn->mount || !vn->mount->fs_private) {
+        return -1;
+    }
+
+    fs = (kifs_fs_t*)vn->mount->fs_private;
+    if (fs->readonly || !inode_read(fs, vn->ino, &ino) || ino.type != KIFS_INO_T_FILE) {
+        return -1;
+    }
+
+    if (len == 0) {
+        return 0;
+    }
+
+    if (offset > UINT64_MAX - len) {
+        return -1;
+    }
+
+    new_size = offset + len;
+    if (new_size < ino.size_bytes) {
+        new_size = ino.size_bytes;
+    }
+
+    tmp = (uint8_t*)kmalloc((size_t)new_size);
+    if (!tmp) {
+        return -1;
+    }
+    memset(tmp, 0, (size_t)new_size);
+
+    if (ino.size_bytes != 0 && kifs_vnode_read(vn, 0, tmp, ino.size_bytes) != (int64_t)ino.size_bytes) {
+        kfree(tmp);
+        return -1;
+    }
+
+    memcpy(tmp + offset, buf, (size_t)len);
+    ok = replace_file_contents(fs, vn, &ino, tmp, new_size) && bcache_sync_dev(fs->dev);
+    kfree(tmp);
+    return ok ? (int64_t)len : -1;
+}
+
+static bool kifs_vnode_create(vnode_t* dir, const char* name, uint32_t mode, vnode_t** out) {
+    kifs_fs_t* fs = NULL;
+    kifs_inode_t parent;
+    kifs_inode_t child;
+    dir_lookup_ctx_t ctx;
+    uint32_t ino_num = 0;
+
+    if (out) {
+        *out = NULL;
+    }
+
+    if (!dir || !dir->mount || !dir->mount->fs_private || !kifs_name_valid(name)) {
+        return false;
+    }
+
+    fs = (kifs_fs_t*)dir->mount->fs_private;
+    if (fs->readonly || !inode_read(fs, dir->ino, &parent) || parent.type != KIFS_INO_T_DIR) {
+        return false;
+    }
+
+    ctx.want = name;
+    ctx.found = false;
+    ctx.found_ino = 0;
+    (void)dir_iterate(fs, &parent, dir_lookup_cb, &ctx);
+    if (ctx.found || !inode_alloc(fs, &ino_num)) {
+        return false;
+    }
+
+    inode_zero(&child);
+    child.type = KIFS_INO_T_FILE;
+    child.mode = mode ? mode : 0644u;
+    child.link_count = 1;
+    child.size_bytes = 0;
+
+    if (!inode_write(fs, ino_num, &child) ||
+        !dir_add_entry(fs, &parent, name, ino_num, 1)) {
+        (void)inode_clear(fs, ino_num);
+        inode_free(fs, ino_num);
+        return false;
+    }
+
+    if (!bcache_sync_dev(fs->dev)) {
+        (void)dir_remove_entry(fs, &parent, name, NULL);
+        (void)inode_clear(fs, ino_num);
+        inode_free(fs, ino_num);
+        return false;
+    }
+
+    return !out || vnode_from_inode(dir->mount, ino_num, out);
+}
+
+static bool kifs_vnode_mkdir(vnode_t* dir, const char* name, uint32_t mode) {
+    kifs_fs_t* fs = NULL;
+    kifs_inode_t parent;
+    kifs_inode_t child;
+    dir_lookup_ctx_t ctx;
+    uint32_t ino_num = 0;
+    uint32_t blkno = 0;
+    uint8_t dirblk[4096];
+
+    if (!dir || !dir->mount || !dir->mount->fs_private || !kifs_name_valid(name)) {
+        return false;
+    }
+
+    fs = (kifs_fs_t*)dir->mount->fs_private;
+    if (fs->readonly || !inode_read(fs, dir->ino, &parent) || parent.type != KIFS_INO_T_DIR) {
+        return false;
+    }
+
+    ctx.want = name;
+    ctx.found = false;
+    ctx.found_ino = 0;
+    (void)dir_iterate(fs, &parent, dir_lookup_cb, &ctx);
+    if (ctx.found || !inode_alloc(fs, &ino_num) || !data_block_alloc(fs, &blkno)) {
+        if (ino_num != 0) {
+            inode_free(fs, ino_num);
+        }
+        return false;
+    }
+
+    init_dir_block(dirblk, dir->ino, fs->meta_crc);
+    {
+        uint32_t doff = ((kifs_shdr_t*)dirblk)->header_bytes;
+        uint16_t r1 = dir_rec_len(1);
+        uint16_t r2 = (uint16_t)((4096u - (uint32_t)((kifs_shdr_t*)dirblk)->header_bytes) - doff - r1);
+        r2 = (uint16_t)(r2 & ~7u);
+        if (r2 < dir_rec_len(2)) {
+            r2 = dir_rec_len(2);
+        }
+        dir_write_ent(dirblk, doff, ino_num, ".", 2, r1);
+        doff += r1;
+        dir_write_ent(dirblk, doff, dir->ino, "..", 2, r2);
+        structured_rechecksum(dirblk, fs->meta_crc);
+    }
+
+    {
+        bcache_buf_t* b = bcache_get(fs->dev, blkno);
+        if (!b) {
+            data_block_free(fs, blkno);
+            inode_free(fs, ino_num);
+            return false;
+        }
+        memcpy(bcache_data(b), dirblk, sizeof(dirblk));
+        bcache_mark_dirty(b);
+        bcache_put(b);
+    }
+
+    inode_zero(&child);
+    child.type = KIFS_INO_T_DIR;
+    child.mode = mode ? mode : 0755u;
+    child.link_count = 2;
+    child.size_bytes = 4096u;
+    child.inline_extent_count = 1;
+    child.inline_extents[0].file_block_start = 0;
+    child.inline_extents[0].disk_block_start = blkno;
+    child.inline_extents[0].block_count = 1;
+
+    if (!inode_write(fs, ino_num, &child) ||
+        !dir_add_entry(fs, &parent, name, ino_num, 2)) {
+        data_block_free(fs, blkno);
+        (void)inode_clear(fs, ino_num);
+        inode_free(fs, ino_num);
+        return false;
+    }
+
+    parent.link_count++;
+    parent.mtime++;
+    parent.ctime++;
+    if (!inode_write(fs, dir->ino, &parent) || !bcache_sync_dev(fs->dev)) {
+        return false;
+    }
+
+    dir->size = parent.size_bytes;
+    return true;
+}
+
+static bool kifs_vnode_unlink(vnode_t* dir, const char* name) {
+    kifs_fs_t* fs = NULL;
+    kifs_inode_t parent;
+    kifs_inode_t child;
+    dir_lookup_ctx_t ctx;
+    uint32_t child_ino = 0;
+
+    if (!dir || !dir->mount || !dir->mount->fs_private || !kifs_name_valid(name)) {
+        return false;
+    }
+
+    fs = (kifs_fs_t*)dir->mount->fs_private;
+    if (fs->readonly || !inode_read(fs, dir->ino, &parent) || parent.type != KIFS_INO_T_DIR) {
+        return false;
+    }
+
+    ctx.want = name;
+    ctx.found = false;
+    ctx.found_ino = 0;
+    (void)dir_iterate(fs, &parent, dir_lookup_cb, &ctx);
+    if (!ctx.found) {
+        return false;
+    }
+
+    child_ino = ctx.found_ino;
+    if (!inode_read(fs, child_ino, &child)) {
+        return false;
+    }
+
+    if (child.type == KIFS_INO_T_DIR) {
+        if (!dir_is_empty(fs, &child)) {
+            return false;
+        }
+    }
+
+    if (!dir_remove_entry(fs, &parent, name, &child_ino)) {
+        return false;
+    }
+
+    if (child.type == KIFS_INO_T_DIR) {
+        if (parent.link_count > 0) {
+            parent.link_count--;
+        }
+        parent.mtime++;
+        parent.ctime++;
+        if (!inode_write(fs, dir->ino, &parent)) {
+            return false;
+        }
+        child.link_count = 0;
+    } else if (child.link_count > 0) {
+        child.link_count--;
+    }
+
+    if (child.link_count == 0) {
+        free_inode_data(fs, &child);
+        if (!inode_clear(fs, child_ino)) {
+            return false;
+        }
+        inode_free(fs, child_ino);
+    } else {
+        child.ctime++;
+        if (!inode_write(fs, child_ino, &child)) {
+            return false;
+        }
+    }
+
+    return bcache_sync_dev(fs->dev);
+}
+
 static const vnode_ops_t g_kifs_vops = {
     .lookup = kifs_vnode_lookup,
     .readdir = kifs_vnode_readdir,
     .read = kifs_vnode_read,
+    .write = kifs_vnode_write,
+    .truncate = kifs_vnode_truncate,
+    .create = kifs_vnode_create,
+    .mkdir = kifs_vnode_mkdir,
+    .unlink = kifs_vnode_unlink,
     .stat = kifs_vnode_stat,
 };
 
@@ -700,10 +1627,6 @@ bool kifs_mount(block_device_t* dev, vfs_mount_t** out_mount) {
 }
 
 // ---------------- mkfs (simple) ----------------
-
-// Bitmap blocks store bits in payload: bytes = 4096 - sizeof(kifs_shdr_t)
-#define KIFS_BITMAP_PAYLOAD_BYTES (KIFS_BLOCK_SIZE - (uint32_t)sizeof(kifs_shdr_t))
-#define KIFS_BITMAP_BITS_PER_BLOCK (KIFS_BITMAP_PAYLOAD_BYTES * 8u)
 
 static void bitmap_set(uint8_t* bm_payload, uint32_t bit) {
     bm_payload[bit / 8u] |= (uint8_t)(1u << (bit % 8u));
@@ -861,7 +1784,7 @@ bool kifs_mkfs(block_device_t* dev, uint32_t inode_count) {
         uint32_t it_blocks = (inode_count + 15u) / 16u;
 
         uint32_t data_start = 2u + bb_blocks + ib_blocks + it_blocks;
-        if (data_start + 4u < usable_blocks) {
+        if (data_start + 6u <= usable_blocks) {
             // enough room
             // Fill superblock
             kifs_superblock_t sb;
@@ -909,8 +1832,25 @@ bool kifs_mkfs(block_device_t* dev, uint32_t inode_count) {
             sb.last_mount_time = 0;
 
             // Allocate initial data blocks
+            static const char* base_dir_names[] = { "bin", "dev", "mnt", "home", "tmp" };
+            enum {
+                KIFS_MKFS_ROOT_INO = 1,
+                KIFS_MKFS_ORPHAN_INO = 2,
+                KIFS_MKFS_BIN_INO = 3,
+                KIFS_MKFS_DEV_INO = 4,
+                KIFS_MKFS_MNT_INO = 5,
+                KIFS_MKFS_HOME_INO = 6,
+                KIFS_MKFS_TMP_INO = 7,
+            };
             uint32_t root_dir_blk = data_start;
-            uint32_t hello_blk = data_start + 1;
+            uint32_t dir_blks[5] = {
+                data_start + 1u,
+                data_start + 2u,
+                data_start + 3u,
+                data_start + 4u,
+                data_start + 5u,
+            };
+            uint8_t* data_mem = NULL;
 
             // Build bitmaps in memory
             // --- block bitmap ---
@@ -931,7 +1871,7 @@ bool kifs_mkfs(block_device_t* dev, uint32_t inode_count) {
 
             // allocated data
             bitmap_set_in_blocks(bb_mem, bb_blocks, root_dir_blk);
-            bitmap_set_in_blocks(bb_mem, bb_blocks, hello_blk);
+            for (uint32_t i = 0; i < 5u; i++) bitmap_set_in_blocks(bb_mem, bb_blocks, dir_blks[i]);
 
             // Recompute bitmap CRCs after bit changes
             for (uint32_t i = 0; i < bb_blocks; i++) {
@@ -949,10 +1889,11 @@ bool kifs_mkfs(block_device_t* dev, uint32_t inode_count) {
 
             for (uint32_t i = 0; i < ib_blocks; i++) {
                 init_bitmap_block(ib_mem + i * 4096u, KIFS_MAGIC_IMB, KIFS_BTYPE_IMB, true);
-            }            bitmap_set_in_blocks(ib_mem, ib_blocks, 0); // reserved
-            bitmap_set_in_blocks(ib_mem, ib_blocks, 1); // root
-            bitmap_set_in_blocks(ib_mem, ib_blocks, 2); // orphan file
-            bitmap_set_in_blocks(ib_mem, ib_blocks, 3); // hello.txt
+            }
+            bitmap_set_in_blocks(ib_mem, ib_blocks, 0); // reserved
+            for (uint32_t ino = KIFS_MKFS_ROOT_INO; ino <= KIFS_MKFS_TMP_INO; ino++) {
+                bitmap_set_in_blocks(ib_mem, ib_blocks, ino);
+            }
 
             for (uint32_t i = 0; i < ib_blocks; i++) {
                 uint8_t* blk = ib_mem + i * 4096u;
@@ -972,7 +1913,7 @@ bool kifs_mkfs(block_device_t* dev, uint32_t inode_count) {
             inode_zero(&root);
             root.type = KIFS_INO_T_DIR;
             root.mode = 0755;
-            root.link_count = 2;
+            root.link_count = 2 + 5u;
             root.size_bytes = 4096;
             root.mtime = 0;
             root.ctime = 0;
@@ -989,60 +1930,78 @@ bool kifs_mkfs(block_device_t* dev, uint32_t inode_count) {
             orphan.link_count = 1;
             orphan.size_bytes = 0;
 
-            // hello inode (3)
-            const char* hello_text = "Hello from KiFS v0.1 on KiwiOS!\n";
-            uint32_t hello_len = (uint32_t)strlen(hello_text);
-
-            kifs_inode_t hello;
-            inode_zero(&hello);
-            hello.type = KIFS_INO_T_FILE;
-            hello.mode = 0644;
-            hello.link_count = 1;
-            hello.size_bytes = hello_len;
-            hello.inline_extent_count = 1;
-            hello.inline_extents[0].file_block_start = 0;
-            hello.inline_extents[0].disk_block_start = hello_blk;
-            hello.inline_extents[0].block_count = 1;
+            kifs_inode_t dirs[5];
+            for (uint32_t i = 0; i < 5u; i++) {
+                inode_zero(&dirs[i]);
+                dirs[i].type = KIFS_INO_T_DIR;
+                dirs[i].mode = 0755;
+                dirs[i].link_count = 2;
+                dirs[i].size_bytes = 4096;
+                dirs[i].inline_extent_count = 1;
+                dirs[i].inline_extents[0].file_block_start = 0;
+                dirs[i].inline_extents[0].disk_block_start = dir_blks[i];
+                dirs[i].inline_extents[0].block_count = 1;
+            }
 
             // Write inodes into table memory
-            memcpy(it_mem + (1u * 256u), &root, sizeof(root));
-            memcpy(it_mem + (2u * 256u), &orphan, sizeof(orphan));
-            memcpy(it_mem + (3u * 256u), &hello, sizeof(hello));
+            memcpy(it_mem + (KIFS_MKFS_ROOT_INO * 256u), &root, sizeof(root));
+            memcpy(it_mem + (KIFS_MKFS_ORPHAN_INO * 256u), &orphan, sizeof(orphan));
+            for (uint32_t i = 0; i < 5u; i++) {
+                memcpy(it_mem + ((KIFS_MKFS_BIN_INO + i) * 256u), &dirs[i], sizeof(dirs[i]));
+            }
+
+            data_mem = (uint8_t*)kmalloc(6u * 4096u);
+            if (!data_mem) {
+                kfree(bb_mem);
+                kfree(ib_mem);
+                kfree(it_mem);
+                return false;
+            }
+            memset(data_mem, 0, 6u * 4096u);
 
             // --- root directory block ---
-            uint8_t dirblk[4096];
-            init_dir_block(dirblk, 1, true);
+            {
+                uint8_t* dirblk = data_mem;
+                uint32_t doff = 0;
 
-            uint32_t doff = (uint32_t)((kifs_shdr_t*)dirblk)->header_bytes;
+                init_dir_block(dirblk, 1, true);
+                doff = (uint32_t)((kifs_shdr_t*)dirblk)->header_bytes;
 
-            // '.'
-            uint16_t r1 = dir_rec_len(1);
-            dir_write_ent(dirblk, doff, 1, ".", 2, r1);
-            doff += r1;
+                dir_write_ent(dirblk, doff, KIFS_MKFS_ROOT_INO, ".", 2, dir_rec_len(1));
+                doff += dir_rec_len(1);
+                dir_write_ent(dirblk, doff, KIFS_MKFS_ROOT_INO, "..", 2, dir_rec_len(2));
+                doff += dir_rec_len(2);
 
-            // '..'
-            uint16_t r2 = dir_rec_len(2);
-            dir_write_ent(dirblk, doff, 1, "..", 2, r2);
-            doff += r2;
+                for (uint32_t i = 0; i < 5u; i++) {
+                    uint16_t rec = dir_rec_len((uint8_t)strlen(base_dir_names[i]));
+                    dir_write_ent(dirblk, doff, KIFS_MKFS_BIN_INO + i, base_dir_names[i], 2, rec);
+                    doff += rec;
+                }
 
-            // 'hello.txt' (last entry fills the block)
-            const char* fname = "hello.txt";
-            uint8_t nlen = (uint8_t)strlen(fname);
-            uint16_t minr3 = dir_rec_len(nlen);
-            uint16_t r3 = (uint16_t)((4096u - (uint32_t)((kifs_shdr_t*)dirblk)->header_bytes) - doff);
-            r3 = (uint16_t)(r3 & ~7u);
-            if (r3 < minr3) r3 = minr3;
-            dir_write_ent(dirblk, doff, 3, fname, 1, r3);
+                structured_rechecksum(dirblk, true);
+            }
 
-            // update dir checksum
-            kifs_shdr_t* dh = (kifs_shdr_t*)dirblk;
-            dh->checksum = 0;
-            dh->checksum = crc32_ieee(dirblk, 4096);
+            // --- base directory blocks ---
+            for (uint32_t i = 0; i < 5u; i++) {
+                uint8_t* dirblk = data_mem + ((i + 1u) * 4096u);
+                uint32_t doff = 0;
+                uint16_t r1 = 0;
+                uint16_t r2 = 0;
 
-            // --- hello data block ---
-            uint8_t helloblk[4096];
-            memset(helloblk, 0, 4096);
-            memcpy(helloblk, hello_text, hello_len);
+                init_dir_block(dirblk, KIFS_MKFS_ROOT_INO, true);
+                doff = (uint32_t)((kifs_shdr_t*)dirblk)->header_bytes;
+
+                r1 = dir_rec_len(1);
+                dir_write_ent(dirblk, doff, KIFS_MKFS_BIN_INO + i, ".", 2, r1);
+                doff += r1;
+
+                r2 = (uint16_t)((4096u - (uint32_t)((kifs_shdr_t*)dirblk)->header_bytes) - doff);
+                r2 = (uint16_t)(r2 & ~7u);
+                if (r2 < dir_rec_len(2)) r2 = dir_rec_len(2);
+                dir_write_ent(dirblk, doff, KIFS_MKFS_ROOT_INO, "..", 2, r2);
+
+                structured_rechecksum(dirblk, true);
+            }
 
             // --- superblock blocks ---
             // primary
@@ -1071,14 +2030,17 @@ bool kifs_mkfs(block_device_t* dev, uint32_t inode_count) {
                 write_block_raw(dev, sb.inode_table_start + i, it_mem + i * 4096u);
             }
 
-            write_block_raw(dev, root_dir_blk, dirblk);
-            write_block_raw(dev, hello_blk, helloblk);
+            write_block_raw(dev, root_dir_blk, data_mem);
+            for (uint32_t i = 0; i < 5u; i++) {
+                write_block_raw(dev, dir_blks[i], data_mem + ((i + 1u) * 4096u));
+            }
 
             bcache_sync_dev(dev);
 
             kfree(bb_mem);
             kfree(ib_mem);
             kfree(it_mem);
+            kfree(data_mem);
 
             log_okf("kifs", "mkfs complete: blocks=%u usable=%u inodes=%u data_start=%u", N, usable_blocks, inode_count, data_start);
             return true;

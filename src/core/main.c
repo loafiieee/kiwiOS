@@ -9,7 +9,9 @@
 #include "core/boot.h"
 #include "core/console.h"
 #include "core/keyboard.h"
+#include "core/kxe.h"
 #include "core/log.h"
+#include "core/scheduler.h"
 #include "core/shell.h"
 #include "core/syscall.h"
 #include "libc/string.h"
@@ -21,6 +23,7 @@
 #include "drivers/serial/serial.h"
 #include "drivers/block/block.h"
 #include "fs/bcache.h"
+#include "fs/devfs/devfs.h"
 #include "vfs/vfs.h"
 
 static void init_pic(void) {
@@ -38,8 +41,21 @@ static void init_pic(void) {
     outb(0x21, 0xFF);
     outb(0xA1, 0xFF);
 
-    // Unmask only IRQ0 (timer)
-    outb(0x21, 0xFE);
+    // Unmask IRQ0 (timer) and IRQ1 (keyboard)
+    outb(0x21, 0xFC);
+}
+
+static void init_pit(uint32_t hz) {
+    uint16_t divisor = 0;
+
+    if (hz == 0) {
+        hz = 100;
+    }
+
+    divisor = (uint16_t)(1193180u / hz);
+    outb(0x43, 0x36);
+    outb(0x40, (uint8_t)(divisor & 0xFFu));
+    outb(0x40, (uint8_t)((divisor >> 8) & 0xFFu));
 }
 
 // Enable x86_64 FPU/SSE for both kernel and userspace.
@@ -64,6 +80,8 @@ static void x86_enable_sse(void) {
 }
 
 void kmain(void) {
+    struct limine_framebuffer* fb = NULL;
+
     if (!boot_limine_supported()) {
         boot_hcf();
     }
@@ -76,6 +94,7 @@ void kmain(void) {
 
     console_init();
     console_clear();
+    fb = console_primary_framebuffer();
     log_ok("console", "Framebuffer console initialized");
 
     bool serial_ok = serial_init();
@@ -118,7 +137,8 @@ void kmain(void) {
     log_ok("memory", "Virtual memory and heap initialized");
 
     init_pic();
-    log_info("interrupts", "PIC initialized and timer unmasked");
+    init_pit(100);
+    log_info("interrupts", "PIC initialized and timer/keyboard unmasked");
 
     // Enable interrupts
     asm volatile ("sti");
@@ -133,10 +153,39 @@ void kmain(void) {
     log_ok("bcache", "Block cache initialized");
 
     vfs_init();
-    // Best-effort auto-mount (may fail if disk is unformatted).
-    vfs_mount_root_auto();
+    bool have_root_fs = vfs_mount_root_auto();
+    if (!have_root_fs) {
+        log_error("vfs", "Root filesystem mount failed; entering recovery mode");
+        print(NULL, "\n[vfs] root mount failed; entering recovery shell\n");
+    }
+    if (!devfs_mount_at("/dev")) {
+        log_error("devfs", "Failed to mount /dev");
+    }
 
-    shell_loop(console_primary_framebuffer());
+    if (have_root_fs) {
+        static const char* const init_candidates[] = { "/bin/init", "/init" };
+        const char* launched_path = NULL;
+        process_t* init = NULL;
+
+        for (uint32_t i = 0; i < (sizeof(init_candidates) / sizeof(init_candidates[0])); i++) {
+            init = kxe_load(init_candidates[i]);
+            if (init) {
+                launched_path = init_candidates[i];
+                break;
+            }
+        }
+
+        if (init) {
+            log_infof("init", "Launching userspace %s", launched_path);
+            scheduler_run(init);
+            log_info("init", "Userspace session ended; falling back to kernel shell");
+            print(NULL, "\n[init] userspace session ended; entering kernel shell\n");
+        } else {
+            log_error("init", "Failed to load /bin/init or /init; entering kernel shell");
+        }
+    }
+
+    shell_loop(fb);
     
     // We should never return here; halt if we do.
     while (1) { asm volatile ("hlt"); }

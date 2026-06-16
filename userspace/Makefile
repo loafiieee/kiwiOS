@@ -1,6 +1,7 @@
 .SUFFIXES:
 
 .PHONY: all clean
+.DEFAULT_GOAL := all
 
 CC ?= cc
 LD ?= ld
@@ -40,11 +41,13 @@ KIWILIB_S := $(wildcard kiwilib/src/*.S)
 KIWILIB_OBJ := $(addprefix build/,$(KIWILIB_C:.c=.c.o) $(KIWILIB_S:.S=.S.o))
 KIWILIB_DEPS := $(addprefix build/,$(KIWILIB_C:.c=.c.d) $(KIWILIB_S:.S=.S.d))
 
-PROGRAMS := hello badptr filetest
+PROGRAMS := hello badptr filetest readtest writetest init shell preempt_a preempt_b preempttest
 PROGRAM_OBJ := $(addprefix build/programs/,$(addsuffix /.main.o,$(PROGRAMS)))
 PROGRAM_ELF := $(addprefix bin/,$(addsuffix .elf,$(PROGRAMS)))
 PROGRAM_KXE := $(addprefix bin/,$(PROGRAMS))
 PROGRAM_DEPS := $(addprefix build/programs/,$(addsuffix /.main.d,$(PROGRAMS)))
+
+$(foreach p,$(PROGRAMS),$(eval build/programs/$(p)/.main.o: programs/$(p)/$(p).c))
 
 all: $(PROGRAM_KXE)
 

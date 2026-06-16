@@ -3,6 +3,7 @@
 #include "arch/x86/io.h"
 #include "core/log.h"
 #include "drivers/ahci/ahci.h"
+#include "drivers/usb/usb_storage.h"
 
 // PCI legacy config I/O ports
 #define PCI_CONFIG_ADDR 0xCF8
@@ -73,6 +74,16 @@ void pci_enable_bus_master(uint8_t bus, uint8_t dev, uint8_t func) {
     }
 }
 
+void pci_enable_io_bus_master(uint8_t bus, uint8_t dev, uint8_t func) {
+    uint16_t cmd = pci_read16(bus, dev, func, 0x04);
+    uint16_t next = (uint16_t)(cmd | (1u << 0) | (1u << 2));
+    if (next != cmd) {
+        pci_write16(bus, dev, func, 0x04, next);
+        log_infof("pci", "Enabled I/O bus mastering: %x:%x.%u CMD %x -> %x",
+                  (unsigned)bus, (unsigned)dev, (unsigned)func, cmd, next);
+    }
+}
+
 void pci_enumerate_and_log(void) {
     log_info("pci", "Scanning buses 0..255");
 
@@ -114,6 +125,23 @@ void pci_enumerate_and_log(void) {
                               bar5, mmio);
                     ahci_probe_mmio(mmio);
 
+                }
+
+                if (class_code == 0x0C && subclass == 0x03 && prog_if == 0x00) {
+                    uint32_t bar4 = pci_read_bar32((uint8_t)bus, dev, func, 4);
+                    uint16_t io_base = (uint16_t)(bar4 & ~0x1fu);
+
+                    if ((bar4 & 1u) == 0u || io_base == 0u) {
+                        log_errorf("usb", "UHCI BAR4 is not a usable I/O BAR: %x", bar4);
+                        continue;
+                    }
+
+                    pci_enable_io_bus_master((uint8_t)bus, dev, func);
+                    log_infof("usb",
+                              "UHCI at %x:%x.%u BAR4=%x io=%x",
+                              (unsigned)bus, (unsigned)dev, (unsigned)func,
+                              bar4, io_base);
+                    uhci_probe_pci((uint8_t)bus, dev, func, io_base);
                 }
             }
         }

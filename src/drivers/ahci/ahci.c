@@ -322,7 +322,9 @@ static bool virt_to_phys_any(uint64_t va, uint64_t* out_pa) {
     return true;
 }
 
-// -------------------- global selected disk state --------------------
+// -------------------- per-disk state --------------------
+
+#define AHCI_MAX_DISKS 8u
 
 typedef struct {
     bool     ready;
@@ -334,13 +336,38 @@ typedef struct {
     uint64_t ct_phys;
 
     volatile uint8_t* mmio_base;
+    uint64_t total_sectors;
+    char     model[41];
 } ahci_disk_t;
 
-static ahci_disk_t g_disk = {0};
+static ahci_disk_t g_disks[AHCI_MAX_DISKS];
+static uint32_t g_disk_count = 0;
+
+static ahci_disk_t* ahci_disk_slot(uint32_t index) {
+    if (index >= g_disk_count) {
+        return NULL;
+    }
+    if (!g_disks[index].ready) {
+        return NULL;
+    }
+    return &g_disks[index];
+}
+
+static int ahci_find_disk_slot(uint32_t mmio_phys32, uint32_t port) {
+    for (uint32_t i = 0; i < g_disk_count; i++) {
+        if (!g_disks[i].ready) {
+            continue;
+        }
+        if (g_disks[i].mmio_phys32 == mmio_phys32 && g_disks[i].port == port) {
+            return (int)i;
+        }
+    }
+    return -1;
+}
 
 // -------------------- probe helpers --------------------
 
-static bool ahci_init_port(uint32_t mmio_phys32, uint32_t port) {
+static bool ahci_init_disk_slot(ahci_disk_t* disk, uint32_t mmio_phys32, uint32_t port) {
     volatile uint8_t* base = ahci_map((uint64_t)mmio_phys32);
     if (!base) return false;
 
@@ -397,13 +424,16 @@ static bool ahci_init_port(uint32_t mmio_phys32, uint32_t port) {
     // Start command engine
     port_start(base, port);
 
-    g_disk.ready = true;
-    g_disk.mmio_phys32 = mmio_phys32;
-    g_disk.port = port;
-    g_disk.clb_phys = clb_phys;
-    g_disk.fb_phys  = fb_phys;
-    g_disk.ct_phys  = ct_phys;
-    g_disk.mmio_base = base;
+    memset(disk, 0, sizeof(*disk));
+    disk->ready = true;
+    disk->mmio_phys32 = mmio_phys32;
+    disk->port = port;
+    disk->clb_phys = clb_phys;
+    disk->fb_phys  = fb_phys;
+    disk->ct_phys  = ct_phys;
+    disk->mmio_base = base;
+    disk->total_sectors = 0;
+    disk->model[0] = '\0';
 
     log_okf("ahci", "Port %u initialized: CLB=%x FB=%x CT=%x",
             port, (uint32_t)clb_phys, (uint32_t)fb_phys, (uint32_t)ct_phys);
@@ -411,11 +441,13 @@ static bool ahci_init_port(uint32_t mmio_phys32, uint32_t port) {
     return true;
 }
 
-static bool ahci_identify_selected_disk(void) {
-    if (!g_disk.ready) return false;
+static bool ahci_identify_disk(ahci_disk_t* disk, uint32_t disk_index) {
+    uint64_t total_sectors = 0;
 
-    volatile uint8_t* base = g_disk.mmio_base;
-    uint32_t port = g_disk.port;
+    if (!disk || !disk->ready) return false;
+
+    volatile uint8_t* base = disk->mmio_base;
+    uint32_t port = disk->port;
     uint32_t px = AHCI_PORT_BASE + port * AHCI_PORT_STRIDE;
 
     if (!port_wait_not_busy(base, port)) {
@@ -432,8 +464,8 @@ static bool ahci_identify_selected_disk(void) {
     void* id_virt = phys_to_virt(id_phys);
     memset(id_virt, 0, PAGE_SIZE);
 
-    hba_cmd_header_t* cmd_list = (hba_cmd_header_t*)phys_to_virt(g_disk.clb_phys);
-    hba_cmd_table_t*  ct       = (hba_cmd_table_t*)phys_to_virt(g_disk.ct_phys);
+    hba_cmd_header_t* cmd_list = (hba_cmd_header_t*)phys_to_virt(disk->clb_phys);
+    hba_cmd_table_t*  ct       = (hba_cmd_table_t*)phys_to_virt(disk->ct_phys);
 
     memset(cmd_list, 0, 32 * sizeof(hba_cmd_header_t));
     memset(ct, 0, PAGE_SIZE);
@@ -443,8 +475,8 @@ static bool ahci_identify_selected_disk(void) {
     ch->w = 0;
     ch->prdtl = 1;
     ch->prdbc = 0;
-    ch->ctba  = (uint32_t)g_disk.ct_phys;
-    ch->ctbau = (uint32_t)(g_disk.ct_phys >> 32);
+    ch->ctba  = (uint32_t)disk->ct_phys;
+    ch->ctbau = (uint32_t)(disk->ct_phys >> 32);
 
     ct->prdt[0].dba  = (uint32_t)id_phys;
     ct->prdt[0].dbau = (uint32_t)(id_phys >> 32);
@@ -464,25 +496,55 @@ static bool ahci_identify_selected_disk(void) {
     }
 
     const uint16_t* idw = (const uint16_t*)id_virt;
-    char model[41];
-    ata_swap_model(model, idw, 27, 20);
-    log_okf("ahci", "IDENTIFY OK: model='%s'", model);
+    ata_swap_model(disk->model, idw, 27, 20);
+
+    total_sectors = ((uint64_t)idw[100]) |
+                    ((uint64_t)idw[101] << 16) |
+                    ((uint64_t)idw[102] << 32) |
+                    ((uint64_t)idw[103] << 48);
+    if (total_sectors == 0) {
+        total_sectors = ((uint64_t)idw[60]) | ((uint64_t)idw[61] << 16);
+    }
+    disk->total_sectors = total_sectors;
+
+    log_okf("ahci", "IDENTIFY OK: disk=%u model='%s'", disk_index, disk->model);
     return true;
 }
 
 // -------------------- public API --------------------
 
 bool ahci_disk_ready(void) {
-    return g_disk.ready;
+    return g_disk_count > 0u && g_disks[0].ready;
 }
 
-static bool ahci_rw(uint8_t ata_cmd, uint64_t lba, uint32_t sector_count, void* buffer) {
-    if (!g_disk.ready) {
+uint32_t ahci_disk_count(void) {
+    return g_disk_count;
+}
+
+uint64_t ahci_disk_total_sectors(uint32_t index) {
+    ahci_disk_t* disk = ahci_disk_slot(index);
+    return disk ? disk->total_sectors : 0u;
+}
+
+static bool ahci_rw_disk(ahci_disk_t* disk,
+                         uint8_t ata_cmd,
+                         uint64_t lba,
+                         uint32_t sector_count,
+                         void* buffer) {
+    if (!disk || !disk->ready) {
         log_error("ahci", "rw: no disk selected");
         return false;
     }
 
     if (sector_count == 0) return false;
+    if (disk->total_sectors != 0u) {
+        if (lba >= disk->total_sectors) {
+            return false;
+        }
+        if ((uint64_t)sector_count > (disk->total_sectors - lba)) {
+            return false;
+        }
+    }
 
     // ATA READ/WRITE DMA EXT uses a 16-bit sector count field.
     // value 0 means 65536 sectors; we won't support >65536 in one command.
@@ -505,8 +567,8 @@ static bool ahci_rw(uint8_t ata_cmd, uint64_t lba, uint32_t sector_count, void* 
         return false;
     }
 
-    volatile uint8_t* base = g_disk.mmio_base;
-    uint32_t port = g_disk.port;
+    volatile uint8_t* base = disk->mmio_base;
+    uint32_t port = disk->port;
     uint32_t px = AHCI_PORT_BASE + port * AHCI_PORT_STRIDE;
 
     if (!port_wait_not_busy(base, port)) {
@@ -518,8 +580,8 @@ static bool ahci_rw(uint8_t ata_cmd, uint64_t lba, uint32_t sector_count, void* 
     wr32(base, px + PxIS,   0xFFFFFFFFu);
 
     // Command list + table (slot 0)
-    hba_cmd_header_t* cmd_list = (hba_cmd_header_t*)phys_to_virt(g_disk.clb_phys);
-    hba_cmd_table_t*  ct       = (hba_cmd_table_t*)phys_to_virt(g_disk.ct_phys);
+    hba_cmd_header_t* cmd_list = (hba_cmd_header_t*)phys_to_virt(disk->clb_phys);
+    hba_cmd_table_t*  ct       = (hba_cmd_table_t*)phys_to_virt(disk->ct_phys);
 
     memset(cmd_list, 0, 32 * sizeof(hba_cmd_header_t));
     memset(ct, 0, PAGE_SIZE);
@@ -528,8 +590,8 @@ static bool ahci_rw(uint8_t ata_cmd, uint64_t lba, uint32_t sector_count, void* 
     ch->cfl = sizeof(fis_reg_h2d_t) / 4;
     ch->w = (ata_cmd == ATA_CMD_WRITE_DMA_EXT) ? 1 : 0;
     ch->prdbc = 0;
-    ch->ctba  = (uint32_t)g_disk.ct_phys;
-    ch->ctbau = (uint32_t)(g_disk.ct_phys >> 32);
+    ch->ctba  = (uint32_t)disk->ct_phys;
+    ch->ctbau = (uint32_t)(disk->ct_phys >> 32);
 
     // Build PRDT (split across pages, preserve offsets)
     uint64_t remaining = bytes;
@@ -611,18 +673,31 @@ static bool ahci_rw(uint8_t ata_cmd, uint64_t lba, uint32_t sector_count, void* 
     return true;
 }
 
+bool ahci_disk_read_index(uint32_t index, uint64_t lba, uint32_t sector_count, void* buffer) {
+    ahci_disk_t* disk = ahci_disk_slot(index);
+    return ahci_rw_disk(disk, ATA_CMD_READ_DMA_EXT, lba, sector_count, buffer);
+}
+
+bool ahci_disk_write_index(uint32_t index, uint64_t lba, uint32_t sector_count, const void* buffer) {
+    ahci_disk_t* disk = ahci_disk_slot(index);
+    return ahci_rw_disk(disk, ATA_CMD_WRITE_DMA_EXT, lba, sector_count, (void*)buffer);
+}
+
+bool ahci_disk_flush_index(uint32_t index) {
+    ahci_disk_t* disk = ahci_disk_slot(index);
+    return disk && disk->ready;
+}
+
 bool ahci_read(uint64_t lba, uint32_t sector_count, void* buffer) {
-    return ahci_rw(ATA_CMD_READ_DMA_EXT, lba, sector_count, buffer);
+    return ahci_disk_read_index(0u, lba, sector_count, buffer);
 }
 
 bool ahci_write(uint64_t lba, uint32_t sector_count, const void* buffer) {
-    return ahci_rw(ATA_CMD_WRITE_DMA_EXT, lba, sector_count, (void*)buffer);
+    return ahci_disk_write_index(0u, lba, sector_count, buffer);
 }
 
 bool ahci_flush(void) {
-    // You can implement real CACHE FLUSH EXT (0xEA) later.
-    // For now, ordering is mainly tested at higher layers.
-    return true;
+    return ahci_disk_flush_index(0u);
 }
 
 // -------------------- probe --------------------
@@ -660,11 +735,24 @@ void ahci_probe_mmio(uint32_t mmio_phys32) {
         if (!active) continue;
         if (sig != SATA_SIG_ATA) continue;
 
-        if (!g_disk.ready) {
-            log_infof("ahci", "Selecting port %u for disk I/O", port);
-            if (ahci_init_port(mmio_phys32, port)) {
-                (void)ahci_identify_selected_disk();
+        if (ahci_find_disk_slot(mmio_phys32, port) >= 0) {
+            continue;
+        }
+
+        if (g_disk_count >= AHCI_MAX_DISKS) {
+            log_errorf("ahci", "Disk registry full; skipping controller=%x port=%u",
+                       mmio_phys32,
+                       port);
+            continue;
+        }
+
+        uint32_t disk_index = g_disk_count;
+        if (ahci_init_disk_slot(&g_disks[disk_index], mmio_phys32, port)) {
+            if (!ahci_identify_disk(&g_disks[disk_index], disk_index)) {
+                log_errorf("ahci", "IDENTIFY failed for disk=%u (continuing with size unknown)", disk_index);
             }
+            g_disk_count++;
+            log_infof("ahci", "Registered disk %u on port %u", disk_index, port);
         }
     }
 }

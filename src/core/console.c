@@ -32,6 +32,7 @@ static void update_layout_from_bounds(void);
 static void reset_scrollback(void);
 static void clear_outputs(void);
 static void render_visible(void);
+static void redraw_input_cursor_cell(bool inverted);
 
 // Call this once early in kmain(), after Limine is ready.
 static void display_init(void) {
@@ -148,6 +149,13 @@ static uint32_t g_head = 0;               // logical line 0 -> g_buffer[g_head]
 static uint32_t g_line_count = 0;         // number of valid lines in buffer
 static uint32_t g_view_offset = 0;        // how many lines up from the newest view is
 static uint32_t g_cursor_col = 0;         // cursor column within the newest line
+static bool g_input_cursor_enabled = false;
+static bool g_input_cursor_visible = false;
+static uint32_t g_input_cursor_line = 0;
+static uint32_t g_input_cursor_col = 0;
+static uint32_t g_input_cursor_ticks = 0;
+
+#define CONSOLE_CURSOR_BLINK_TICKS 25u
 
 static inline uint32_t wrap_line(uint32_t logical) {
     return (g_head + logical) % SCROLLBACK_LINES;
@@ -169,6 +177,11 @@ static void reset_scrollback(void) {
     g_line_count = 1;
     g_view_offset = 0;
     g_cursor_col = 0;
+    g_input_cursor_enabled = false;
+    g_input_cursor_visible = false;
+    g_input_cursor_line = 0;
+    g_input_cursor_col = 0;
+    g_input_cursor_ticks = 0;
     clear_line(0);
 }
 
@@ -362,6 +375,119 @@ void console_clear(void) {
     reset_scrollback();
     clear_outputs();
     render_visible();
+}
+
+void console_set_input_line(const char *prefix,
+                            const char *text,
+                            uint32_t text_len,
+                            uint32_t cursor_pos,
+                            bool show_cursor) {
+    uint32_t logical_line = 0;
+    uint32_t idx = 0;
+    uint32_t start = 0;
+    uint32_t view_row = 0;
+    uint32_t col = 0;
+    uint32_t cursor_col = 0;
+
+    if (g_line_count == 0) {
+        reset_scrollback();
+    }
+
+    if (cursor_pos > text_len) {
+        cursor_pos = text_len;
+    }
+
+    if (g_input_cursor_visible) {
+        redraw_input_cursor_cell(false);
+        g_input_cursor_visible = false;
+    }
+
+    logical_line = g_line_count - 1;
+    idx = wrap_line(logical_line);
+
+    for (col = 0; col < g_cols; col++) {
+        g_buffer[idx][col].ch = ' ';
+        g_buffer[idx][col].fg = fg_color;
+        g_buffer[idx][col].bg = bg_color;
+    }
+
+    col = 0;
+    if (prefix) {
+        while (*prefix && col < g_cols) {
+            g_buffer[idx][col].ch = *prefix++;
+            g_buffer[idx][col].fg = fg_color;
+            g_buffer[idx][col].bg = bg_color;
+            col++;
+        }
+    }
+
+    cursor_col = col + cursor_pos;
+    for (uint32_t i = 0; i < text_len && col < g_cols; i++, col++) {
+        g_buffer[idx][col].ch = text[i];
+        g_buffer[idx][col].fg = fg_color;
+        g_buffer[idx][col].bg = bg_color;
+    }
+
+    g_cursor_col = col;
+    g_input_cursor_enabled = show_cursor && cursor_col < g_cols;
+    g_input_cursor_line = logical_line;
+    g_input_cursor_col = cursor_col;
+    g_input_cursor_ticks = 0;
+
+    start = view_start_line();
+    if (logical_line < start || logical_line >= start + g_rows) {
+        return;
+    }
+
+    view_row = logical_line - start;
+    render_line_to_row(logical_line, view_row);
+
+    if (g_input_cursor_enabled) {
+        redraw_input_cursor_cell(true);
+        g_input_cursor_visible = true;
+    }
+}
+
+void console_timer_tick(void) {
+    if (!g_input_cursor_enabled) {
+        return;
+    }
+
+    g_input_cursor_ticks++;
+    if (g_input_cursor_ticks < CONSOLE_CURSOR_BLINK_TICKS) {
+        return;
+    }
+
+    g_input_cursor_ticks = 0;
+    g_input_cursor_visible = !g_input_cursor_visible;
+    redraw_input_cursor_cell(g_input_cursor_visible);
+}
+
+static void redraw_input_cursor_cell(bool inverted) {
+    uint32_t start = 0;
+    uint32_t view_row = 0;
+    uint32_t idx = 0;
+    struct cell cell = { ' ', fg_color, bg_color };
+
+    if (!g_input_cursor_enabled || g_input_cursor_col >= g_cols) {
+        return;
+    }
+
+    start = view_start_line();
+    if (g_input_cursor_line < start || g_input_cursor_line >= start + g_rows) {
+        return;
+    }
+
+    idx = wrap_line(g_input_cursor_line);
+    cell = g_buffer[idx][g_input_cursor_col];
+    if (inverted) {
+        uint32_t tmp = cell.fg;
+        cell.fg = cell.bg;
+        cell.bg = tmp;
+    }
+
+    view_row = g_input_cursor_line - start;
+    draw_cell(view_row, g_input_cursor_col, &cell);
 }
 
 // --- Required exports (same names as your existing code) ---

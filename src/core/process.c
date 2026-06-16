@@ -9,8 +9,14 @@
 #include "memory/vmm.h"
 #include "vfs/vfs.h"
 
-#define PROC_KERNEL_STACK_PAGES 2u
+#define PROC_KERNEL_STACK_PAGES 4u
+#define PROC_DEFAULT_TIME_SLICE 5u
 #define PTE_GET_ADDR(entry) ((entry) & 0x000FFFFFFFFFF000ULL)
+
+extern void process_enter_context_asm(uint64_t next_cr3,
+                                      uint64_t next_kernel_rsp,
+                                      const process_context_t* ctx)
+    __attribute__((noreturn));
 
 static process_t g_procs[PROC_MAX];
 static process_t* g_current = NULL;
@@ -78,6 +84,8 @@ process_t* process_create(const char* name) {
     copy_name(proc->name, name);
     proc->state = PROC_READY;
     proc->exit_code = 0;
+    proc->resume_kind = PROC_RESUME_USER;
+    proc->ticks_remaining = PROC_DEFAULT_TIME_SLICE;
 
     proc->page_table = vmm_create_page_table();
     if (!proc->page_table) {
@@ -181,6 +189,31 @@ void process_set_current(process_t* proc) {
     g_current = proc;
 }
 
+void process_reap_zombies(void) {
+    for (uint32_t i = 0; i < PROC_MAX; i++) {
+        process_t* proc = &g_procs[i];
+        if (proc == g_current || proc->state != PROC_ZOMBIE) {
+            continue;
+        }
+
+        if (proc->ppid != 0 && process_by_pid(proc->ppid) != NULL) {
+            continue;
+        }
+
+        process_destroy(proc);
+    }
+}
+
+bool process_has_blocked(void) {
+    for (uint32_t i = 0; i < PROC_MAX; i++) {
+        if (g_procs[i].state == PROC_BLOCKED) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
 bool process_map_user_stack(process_t* proc, uint64_t stack_top, uint32_t page_count) {
     if (!proc || !proc->page_table || page_count == 0) {
         return false;
@@ -211,6 +244,8 @@ bool process_map_user_stack(process_t* proc, uint64_t stack_top, uint32_t page_c
 }
 
 __attribute__((noreturn)) void process_enter(process_t* proc) {
+    uint64_t next_cr3 = 0;
+
     if (!proc || !proc->page_table) {
         asm volatile("cli");
         for (;;) {
@@ -223,22 +258,6 @@ __attribute__((noreturn)) void process_enter(process_t* proc) {
     kernel_rsp_current = proc->kernel_stack_top;
     tss_set_kernel_stack(proc->kernel_stack_top);
 
-    asm volatile("cli");
-    vmm_switch_page_table(proc->page_table);
-
-    asm volatile(
-        "pushq $0x1B\n"
-        "pushq %[user_rsp]\n"
-        "pushq %[user_rflags]\n"
-        "pushq $0x23\n"
-        "pushq %[entry]\n"
-        "iretq\n"
-        :
-        : [user_rsp] "r"(proc->saved_rsp),
-          [user_rflags] "r"(proc->saved_rflags),
-          [entry] "r"(proc->saved_rip)
-        : "memory"
-    );
-
-    __builtin_unreachable();
+    next_cr3 = (uint64_t)(uintptr_t)proc->page_table->pml4_phys;
+    process_enter_context_asm(next_cr3, proc->kernel_stack_top, &proc->context);
 }

@@ -6,6 +6,7 @@
 #include "core/keyboard.h"
 #include "core/kxe.h"
 #include "core/log.h"
+#include "core/scheduler.h"
 #include "core/usertest.h"
 #include "drivers/block/block.h"
 #include "libc/string.h"
@@ -65,11 +66,37 @@ static const char* skip_token(const char* s) {
     return s;
 }
 
+static bool parse_u32_strict(const char* s, uint32_t* out) {
+    if (!s || !out) {
+        return false;
+    }
+
+    while (*s == ' ') s++;
+    if (*s == '\0') {
+        return false;
+    }
+
+    if (!parse_u32(s, out)) {
+        return false;
+    }
+
+    while (*s >= '0' && *s <= '9') {
+        s++;
+    }
+
+    return *s == '\0';
+}
+
 static const char* trim_spaces(const char* s);
+static bool copy_next_token(const char** s, char* out, uint32_t out_cap);
+static bool normalize_shell_path(const char* in, char* out, uint32_t out_cap);
+static bool resolve_program_path(const char* in, char* out, uint32_t out_cap);
+
+static char g_shell_cwd[256] = "/";
 
 // ================= Command functions =================
 static void cmd_help(struct limine_framebuffer *fb) {
-    print(fb, "Commands: help clear echo about crash meminfo memtest vmtest heaptest fbinfo scale partlist disktest mount kifs ls stat cat exec usertest\n");
+    print(fb, "Commands: help clear echo about crash meminfo memtest vmtest heaptest fbinfo scale partlist rescan disktest mount kifs pwd cd ls stat cat touch mkdir rm cp mv exec usertest\n");
 }
 
 
@@ -499,6 +526,25 @@ static block_device_t* get_part(struct limine_framebuffer *fb, uint32_t idx) {
     return block_partition_device(idx);
 }
 
+static block_device_t* resolve_block_device_spec(const char* spec, bool allow_partition_index) {
+    const char* name = spec;
+    uint32_t part_index = 0;
+
+    if (!spec || !*spec) {
+        return NULL;
+    }
+
+    if (allow_partition_index && parse_u32_strict(spec, &part_index)) {
+        return block_partition_device(part_index);
+    }
+
+    if (strncmp(name, "/dev/", 5u) == 0) {
+        name += 5u;
+    }
+
+    return block_device_by_name(name);
+}
+
 // -------- Core disk ops (shared) --------
 
 static bool do_diskread(struct limine_framebuffer* fb, block_device_t* dev, uint64_t lba, uint32_t count) {
@@ -611,7 +657,7 @@ static bool do_diskwrite(struct limine_framebuffer* fb, block_device_t* dev, uin
 static void cmd_rawread(struct limine_framebuffer *fb, const char *args) {
     print(fb, "WARNING, reading from RAW DISK, not a partition!\n");
     print(fb, "Press ENTER to continue...\n");
-    char c = keyboard_getchar();
+    int c = keyboard_getchar();
     if (c != '\n') {
         print(fb, "\nRead aborted by user.\n");
         return;
@@ -639,7 +685,7 @@ static void cmd_rawread(struct limine_framebuffer *fb, const char *args) {
 static void cmd_rawwrite(struct limine_framebuffer *fb, const char *args) {
     print(fb, "WARNING, writing to RAW DISK, not a partition!\n");
     print(fb, "Press ENTER to continue...\n");
-    char c = keyboard_getchar();
+    int c = keyboard_getchar();
     if (c != '\n') {
         print(fb, "\nWrite aborted by user.\n");
         return;
@@ -681,7 +727,7 @@ static void cmd_rawwrite(struct limine_framebuffer *fb, const char *args) {
 static void cmd_rawflush(struct limine_framebuffer *fb) {
     print(fb, "WARNING, writing to RAW DISK, not a partition!\n");
     print(fb, "Press ENTER to continue...\n");
-    char c = keyboard_getchar();
+    int c = keyboard_getchar();
     if (c != '\n') {
         print(fb, "\nFlush aborted by user.\n");
         return;
@@ -703,16 +749,33 @@ static void cmd_rawflush(struct limine_framebuffer *fb) {
 }
 
 static void cmd_partlist(struct limine_framebuffer* fb) {
-    part_table_type_t t = block_partition_table_type();
+    uint32_t disk_n = block_disk_count();
+    uint32_t n = block_partition_count();
 
-    print(fb, "Partition table: ");
-    switch (t) {
-        case PART_TABLE_GPT: print(fb, "GPT\n"); break;
-        case PART_TABLE_MBR: print(fb, "MBR\n"); break;
-        default:             print(fb, "none\n"); break;
+    print(fb, "Disks found: ");
+    print_hex(fb, disk_n);
+    print(fb, "\n");
+
+    for (uint32_t i = 0; i < disk_n; i++) {
+        block_device_t* d = block_disk_device(i);
+        part_table_type_t t = block_disk_partition_table_type(i);
+        if (!d) continue;
+
+        print(fb, "  [");
+        print_hex(fb, i);
+        print(fb, "] ");
+        print(fb, d->name ? d->name : "(noname)");
+        print(fb, "  sectors=");
+        print_hex(fb, d->total_sectors);
+        print(fb, "  table=");
+        switch (t) {
+            case PART_TABLE_GPT: print(fb, "GPT"); break;
+            case PART_TABLE_MBR: print(fb, "MBR"); break;
+            default:             print(fb, "none"); break;
+        }
+        print(fb, "\n");
     }
 
-    uint32_t n = block_partition_count();
     print(fb, "Partitions found: ");
     print_hex(fb, n);
     print(fb, "\n");
@@ -730,6 +793,14 @@ static void cmd_partlist(struct limine_framebuffer* fb) {
         print_hex(fb, p->total_sectors);
         print(fb, "\n");
     }
+}
+
+static void cmd_rescan(struct limine_framebuffer* fb) {
+    uint32_t added = block_rescan();
+
+    print(fb, "rescan: found ");
+    print_u32(fb, added);
+    print(fb, " new disk(s)\n");
 }
 
 static void cmd_diskreadp(struct limine_framebuffer* fb, const char* args) {
@@ -900,22 +971,395 @@ static const char* trim_spaces(const char* s) {
     return s;
 }
 
-static void cmd_mount(struct limine_framebuffer* fb, const char* args) {
-    args = trim_spaces(args);
+static bool copy_next_token(const char** s, char* out, uint32_t out_cap) {
+    const char* cur = NULL;
+    uint32_t len = 0;
 
+    if (!s || !out || out_cap == 0) return false;
+    cur = trim_spaces(*s);
+    if (!cur || *cur == '\0') return false;
+
+    while (cur[len] && cur[len] != ' ') {
+        len++;
+    }
+
+    if (len + 1u > out_cap) return false;
+    memcpy(out, cur, len);
+    out[len] = '\0';
+    *s = skip_token(cur);
+    return true;
+}
+
+static void shell_path_pop_component(char* path) {
+    uint32_t len = 0;
+
+    if (!path) return;
+    len = (uint32_t)strlen(path);
+    if (len <= 1u) {
+        path[0] = '/';
+        path[1] = '\0';
+        return;
+    }
+
+    while (len > 1u && path[len - 1u] == '/') {
+        len--;
+    }
+
+    while (len > 1u && path[len - 1u] != '/') {
+        len--;
+    }
+
+    if (len <= 1u) {
+        path[0] = '/';
+        path[1] = '\0';
+        return;
+    }
+
+    path[len - 1u] = '\0';
+}
+
+static bool shell_path_append_component(char* path, uint32_t out_cap, const char* comp, uint32_t comp_len) {
+    uint32_t cur_len = 0;
+
+    if (!path || !comp || comp_len == 0u) return true;
+
+    if (comp_len == 1u && comp[0] == '.') {
+        return true;
+    }
+
+    if (comp_len == 2u && comp[0] == '.' && comp[1] == '.') {
+        shell_path_pop_component(path);
+        return true;
+    }
+
+    cur_len = (uint32_t)strlen(path);
+    if (cur_len == 0u) {
+        if (out_cap < 2u) return false;
+        path[0] = '/';
+        path[1] = '\0';
+        cur_len = 1u;
+    }
+
+    if (cur_len > 1u) {
+        if (cur_len + 1u >= out_cap) return false;
+        path[cur_len++] = '/';
+        path[cur_len] = '\0';
+    }
+
+    if (cur_len + comp_len + 1u > out_cap) return false;
+    memcpy(path + cur_len, comp, comp_len);
+    path[cur_len + comp_len] = '\0';
+    return true;
+}
+
+static bool shell_path_has_slash(const char* s) {
+    if (!s) return false;
+    while (*s) {
+        if (*s == '/') return true;
+        s++;
+    }
+    return false;
+}
+
+static bool normalize_shell_path(const char* in, char* out, uint32_t out_cap) {
+    const char* cur = NULL;
+
+    if (!in || !*in || !out || out_cap < 2u) return false;
+
+    if (in[0] == '/') {
+        out[0] = '/';
+        out[1] = '\0';
+        cur = in + 1;
+    } else {
+        uint32_t cwd_len = (uint32_t)strlen(g_shell_cwd);
+        if (cwd_len + 1u > out_cap) return false;
+        memcpy(out, g_shell_cwd, cwd_len + 1u);
+        cur = in;
+    }
+
+    while (*cur) {
+        const char* comp = NULL;
+        uint32_t comp_len = 0;
+
+        while (*cur == '/') cur++;
+        if (*cur == '\0') break;
+
+        comp = cur;
+        while (*cur && *cur != '/') cur++;
+        comp_len = (uint32_t)(cur - comp);
+
+        if (!shell_path_append_component(out, out_cap, comp, comp_len)) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+static bool resolve_program_path(const char* in, char* out, uint32_t out_cap) {
+    vnode_t* vn = NULL;
+    const char* root_prefix = "/";
+    const char* bin_prefix = "/bin/";
+    uint32_t in_len = 0;
+    uint32_t prefix_len = 0;
+
+    if (!in || !*in || !out || out_cap < 2u) return false;
+
+    if (in[0] == '/' || shell_path_has_slash(in)) {
+        return normalize_shell_path(in, out, out_cap);
+    }
+
+    in_len = (uint32_t)strlen(in);
+
+    prefix_len = (uint32_t)strlen(bin_prefix);
+    if (prefix_len + in_len + 1u <= out_cap) {
+        memcpy(out, bin_prefix, prefix_len);
+        memcpy(out + prefix_len, in, in_len + 1u);
+        if (vfs_resolve(out, &vn) && vn) {
+            if (vn->type == VNODE_FILE) {
+                vfs_vnode_put(vn);
+                return true;
+            }
+            vfs_vnode_put(vn);
+        }
+    }
+
+    prefix_len = (uint32_t)strlen(root_prefix);
+    if (prefix_len + in_len + 1u <= out_cap) {
+        memcpy(out, root_prefix, prefix_len);
+        memcpy(out + prefix_len, in, in_len + 1u);
+        if (vfs_resolve(out, &vn) && vn) {
+            if (vn->type == VNODE_FILE) {
+                vfs_vnode_put(vn);
+                return true;
+            }
+            vfs_vnode_put(vn);
+        }
+    }
+
+    return false;
+}
+
+static const char* shell_path_basename(const char* path) {
+    const char* last = NULL;
+
+    if (!path || !*path) {
+        return NULL;
+    }
+
+    last = path;
+    while (*path) {
+        if (*path == '/' && path[1] != '\0') {
+            last = path + 1;
+        }
+        path++;
+    }
+
+    return last;
+}
+
+static bool resolve_copy_target_path(const char* src_path,
+                                     const char* dst_path,
+                                     char* out,
+                                     uint32_t out_cap) {
+    vnode_t* vn = NULL;
+    const char* base = NULL;
+    uint32_t dst_len = 0;
+    uint32_t base_len = 0;
+
+    if (!src_path || !dst_path || !out || out_cap < 2u) {
+        return false;
+    }
+
+    if (!(vfs_resolve(dst_path, &vn) && vn && vn->type == VNODE_DIR)) {
+        if (vn) {
+            vfs_vnode_put(vn);
+        }
+        dst_len = (uint32_t)strlen(dst_path);
+        if (dst_len + 1u > out_cap) {
+            return false;
+        }
+        memcpy(out, dst_path, dst_len + 1u);
+        return true;
+    }
+    vfs_vnode_put(vn);
+
+    base = shell_path_basename(src_path);
+    if (!base || !*base) {
+        return false;
+    }
+
+    dst_len = (uint32_t)strlen(dst_path);
+    base_len = (uint32_t)strlen(base);
+
+    if (strcmp(dst_path, "/") == 0) {
+        if (1u + base_len + 1u > out_cap) {
+            return false;
+        }
+        out[0] = '/';
+        memcpy(out + 1u, base, base_len + 1u);
+        return true;
+    }
+
+    if (dst_len + 1u + base_len + 1u > out_cap) {
+        return false;
+    }
+
+    memcpy(out, dst_path, dst_len);
+    out[dst_len] = '/';
+    memcpy(out + dst_len + 1u, base, base_len + 1u);
+    return true;
+}
+
+static bool ensure_writable_vnode(const char* path, vnode_t** out) {
+    vnode_t* vn = NULL;
+
+    if (!out) return false;
+    *out = NULL;
+
+    if (vfs_resolve(path, &vn) && vn) {
+        if (!vn->ops || !vn->ops->write || !vn->ops->truncate) {
+            vfs_vnode_put(vn);
+            return false;
+        }
+        if (!vn->ops->truncate(vn, 0)) {
+            vfs_vnode_put(vn);
+            return false;
+        }
+        *out = vn;
+        return true;
+    }
+
+    if (!vfs_create(path, 0644u, &vn) || !vn) {
+        return false;
+    }
+
+    if (!vn->ops || !vn->ops->write) {
+        vfs_vnode_put(vn);
+        return false;
+    }
+
+    *out = vn;
+    return true;
+}
+
+static bool copy_file_vfs(struct limine_framebuffer* fb,
+                          const char* src_path,
+                          const char* dst_path,
+                          bool unlink_source) {
+    vnode_t* src = NULL;
+    vnode_t* dst = NULL;
+    uint8_t* tmp = NULL;
+    uint64_t src_off = 0;
+    uint64_t dst_off = 0;
+
+    if (!src_path || !dst_path || strcmp(src_path, dst_path) == 0) {
+        print(fb, unlink_source ? "mv: invalid paths\n" : "cp: invalid paths\n");
+        return false;
+    }
+
+    if (!vfs_resolve(src_path, &src) || !src) {
+        print(fb, unlink_source ? "mv: source not found\n" : "cp: source not found\n");
+        return false;
+    }
+
+    if (src->type != VNODE_FILE || !src->ops || !src->ops->read) {
+        print(fb, unlink_source ? "mv: only regular files supported\n" : "cp: only regular files supported\n");
+        vfs_vnode_put(src);
+        return false;
+    }
+
+    if (!ensure_writable_vnode(dst_path, &dst) || !dst) {
+        print(fb, unlink_source ? "mv: destination open failed\n" : "cp: destination open failed\n");
+        vfs_vnode_put(src);
+        return false;
+    }
+
+    tmp = (uint8_t*)kmalloc(512u);
+    if (!tmp) {
+        print(fb, "copy: oom\n");
+        vfs_vnode_put(src);
+        vfs_vnode_put(dst);
+        return false;
+    }
+
+    while (1) {
+        int64_t n = src->ops->read(src, src_off, tmp, 512u);
+        if (n < 0) {
+            print(fb, unlink_source ? "mv: read failed\n" : "cp: read failed\n");
+            kfree(tmp);
+            vfs_vnode_put(src);
+            vfs_vnode_put(dst);
+            return false;
+        }
+        if (n == 0) break;
+        if (!dst->ops || !dst->ops->write || dst->ops->write(dst, dst_off, tmp, (uint64_t)n) != n) {
+            print(fb, unlink_source ? "mv: write failed\n" : "cp: write failed\n");
+            kfree(tmp);
+            vfs_vnode_put(src);
+            vfs_vnode_put(dst);
+            return false;
+        }
+        src_off += (uint64_t)n;
+        dst_off += (uint64_t)n;
+    }
+
+    kfree(tmp);
+    vfs_vnode_put(src);
+    vfs_vnode_put(dst);
+
+    if (unlink_source && !vfs_unlink(src_path)) {
+        print(fb, "mv: unlink failed\n");
+        return false;
+    }
+
+    return true;
+}
+
+static block_device_t* resolve_mount_device_spec(const char* spec) {
+    return resolve_block_device_spec(spec, true);
+}
+
+static void cmd_mount(struct limine_framebuffer* fb, const char* args) {
+    const char* cur = trim_spaces(args);
+    char dev_buf[64];
+    char path_buf[256];
+    char target_path[256];
     bool ok = false;
-    if (args && *args) {
-        uint32_t idx = 0;
-        if (!parse_u32(args, &idx)) {
-            print(fb, "Usage: mount [part]\n");
+    const char* mounted_path = "/";
+
+    if (cur && *cur) {
+        block_device_t* dev = NULL;
+
+        if (!copy_next_token(&cur, dev_buf, sizeof(dev_buf))) {
+            print(fb, "Usage: mount [device [path]]\n");
             return;
         }
-        block_device_t* dev = block_partition_device(idx);
+
+        dev = resolve_mount_device_spec(dev_buf);
         if (!dev) {
-            print(fb, "mount: invalid partition index\n");
+            (void)block_rescan();
+            dev = resolve_mount_device_spec(dev_buf);
+        }
+        if (!dev) {
+            print(fb, "mount: invalid device or partition\n");
             return;
         }
-        ok = vfs_mount_root_dev(dev);
+
+        cur = trim_spaces(cur);
+        if (*cur == '\0') {
+            ok = vfs_mount_root_dev(dev);
+        } else {
+            if (!copy_next_token(&cur, path_buf, sizeof(path_buf)) ||
+                !normalize_shell_path(path_buf, target_path, sizeof(target_path)) ||
+                *trim_spaces(cur) != '\0') {
+                print(fb, "Usage: mount [device [path]]\n");
+                return;
+            }
+
+            mounted_path = target_path;
+            ok = vfs_mount_dev(target_path, dev);
+        }
     } else {
         ok = vfs_mount_root_auto();
     }
@@ -925,13 +1369,15 @@ static void cmd_mount(struct limine_framebuffer* fb, const char* args) {
         return;
     }
 
-    vfs_mount_t* m = vfs_root_mount();
+    vfs_mount_t* m = vfs_mount_at(mounted_path);
     if (!m) {
         print(fb, "mount: FAILED (no mount)\n");
         return;
     }
 
-    print(fb, "mount: OK (fs=");
+    print(fb, "mount: OK (path=");
+    print(fb, m->mount_path[0] ? m->mount_path : "?");
+    print(fb, ", fs=");
     print(fb, m->fs_name ? m->fs_name : "?");
     print(fb, ", dev=");
     print(fb, m->dev && m->dev->name ? m->dev->name : "?");
@@ -939,22 +1385,21 @@ static void cmd_mount(struct limine_framebuffer* fb, const char* args) {
 }
 
 static void cmd_mkfs_kifs(struct limine_framebuffer* fb, const char* args) {
+    char dev_buf[64];
     args = trim_spaces(args);
-    uint32_t idx = 0;
-    if (!parse_u32(args, &idx)) {
-        print(fb, "Usage: mkfs.kifs <part> [inodes]\n");
+    if (!copy_next_token(&args, dev_buf, sizeof(dev_buf))) {
+        print(fb, "Usage: mkfs.kifs <device> [inodes]\n");
         return;
     }
-    args = skip_token(args);
 
     uint32_t inodes = 1024;
     if (args && *args) {
         parse_u32(args, &inodes);
     }
 
-    block_device_t* dev = block_partition_device(idx);
+    block_device_t* dev = resolve_block_device_spec(dev_buf, true);
     if (!dev) {
-        print(fb, "mkfs.kifs: invalid partition index\n");
+        print(fb, "mkfs.kifs: invalid device\n");
         return;
     }
 
@@ -1068,8 +1513,8 @@ static void cmd_kifs(struct limine_framebuffer* fb, const char* args) {
         print(fb, "Usage: kifs <subcmd> ...\n");
         print(fb, "  kifs sb\n");
         print(fb, "  kifs bmdump [nbits]\n");
-        print(fb, "  kifs mkfs <part> [inodes]\n");
-        print(fb, "  kifs mount [part]\n");
+        print(fb, "  kifs mkfs <device> [inodes]\n");
+        print(fb, "  kifs mount [device [path]]\n");
         return;
     }
 
@@ -1107,14 +1552,64 @@ typedef struct {
 static bool ls_cb(const char* name, uint32_t ino, void* user) {
     (void)ino;
     ls_ctx_t* ctx = (ls_ctx_t*)user;
+    if (strcmp(name, ".") == 0 || strcmp(name, "..") == 0) {
+        return true;
+    }
     print(ctx->fb, name);
     print(ctx->fb, "\n");
     return true;
 }
 
+static void cmd_pwd(struct limine_framebuffer* fb, const char* args) {
+    if (args && *trim_spaces(args) != '\0') {
+        print(fb, "Usage: pwd\n");
+        return;
+    }
+
+    print(fb, g_shell_cwd);
+    print(fb, "\n");
+}
+
+static void cmd_cd(struct limine_framebuffer* fb, const char* args) {
+    const char* cur = trim_spaces(args);
+    char raw[256];
+    char path[256];
+    vnode_t* vn = NULL;
+
+    if (!cur || !*cur) {
+        path[0] = '/';
+        path[1] = '\0';
+    } else if (!copy_next_token(&cur, raw, sizeof(raw)) ||
+               !normalize_shell_path(raw, path, sizeof(path)) ||
+               *trim_spaces(cur) != '\0') {
+        print(fb, "Usage: cd [path]\n");
+        return;
+    }
+
+    if (!vfs_resolve(path, &vn) || !vn || vn->type != VNODE_DIR) {
+        if (vn) vfs_vnode_put(vn);
+        print(fb, "cd: not a directory\n");
+        return;
+    }
+
+    vfs_vnode_put(vn);
+    memcpy(g_shell_cwd, path, strlen(path) + 1u);
+}
+
 static void cmd_ls(struct limine_framebuffer* fb, const char* args) {
-    const char* path = trim_spaces(args);
-    if (!path || !*path) path = "/";
+    const char* cur = trim_spaces(args);
+    char raw[256];
+    char path[256];
+    ls_ctx_t ctx = { .fb = fb };
+
+    if (!cur || !*cur) {
+        memcpy(path, g_shell_cwd, strlen(g_shell_cwd) + 1u);
+    } else if (!copy_next_token(&cur, raw, sizeof(raw)) ||
+               !normalize_shell_path(raw, path, sizeof(path)) ||
+               *trim_spaces(cur) != '\0') {
+        print(fb, "Usage: ls [path]\n");
+        return;
+    }
 
     vnode_t* vn = NULL;
     if (!vfs_resolve(path, &vn) || !vn) {
@@ -1127,21 +1622,21 @@ static void cmd_ls(struct limine_framebuffer* fb, const char* args) {
         vfs_vnode_put(vn);
         return;
     }
-
-    if (!vn->ops || !vn->ops->readdir) {
-        print(fb, "ls: no readdir\n");
-        vfs_vnode_put(vn);
-        return;
-    }
-
-    ls_ctx_t ctx = { .fb = fb };
-    vn->ops->readdir(vn, ls_cb, &ctx);
     vfs_vnode_put(vn);
+
+    if (!vfs_readdir(path, ls_cb, &ctx)) {
+        print(fb, "ls: no readdir\n");
+    }
 }
 
 static void cmd_stat(struct limine_framebuffer* fb, const char* args) {
-    const char* path = trim_spaces(args);
-    if (!path || !*path) {
+    const char* cur = trim_spaces(args);
+    char raw[256];
+    char path[256];
+
+    if (!copy_next_token(&cur, raw, sizeof(raw)) ||
+        !normalize_shell_path(raw, path, sizeof(path)) ||
+        *trim_spaces(cur) != '\0') {
         print(fb, "Usage: stat <path>\n");
         return;
     }
@@ -1179,8 +1674,13 @@ static void cmd_stat(struct limine_framebuffer* fb, const char* args) {
 }
 
 static void cmd_cat(struct limine_framebuffer* fb, const char* args) {
-    const char* path = trim_spaces(args);
-    if (!path || !*path) {
+    const char* cur = trim_spaces(args);
+    char raw[256];
+    char path[256];
+
+    if (!copy_next_token(&cur, raw, sizeof(raw)) ||
+        !normalize_shell_path(raw, path, sizeof(path)) ||
+        *trim_spaces(cur) != '\0') {
         print(fb, "Usage: cat <path>\n");
         return;
     }
@@ -1223,9 +1723,127 @@ static void cmd_cat(struct limine_framebuffer* fb, const char* args) {
     vfs_vnode_put(vn);
 }
 
+static void cmd_touch(struct limine_framebuffer* fb, const char* args) {
+    const char* cur = trim_spaces(args);
+    char raw[256];
+    char path[256];
+    vnode_t* vn = NULL;
+
+    if (!copy_next_token(&cur, raw, sizeof(raw)) ||
+        !normalize_shell_path(raw, path, sizeof(path)) ||
+        *trim_spaces(cur) != '\0') {
+        print(fb, "Usage: touch <path>\n");
+        return;
+    }
+
+    if (vfs_resolve(path, &vn) && vn) {
+        if (vn->type != VNODE_FILE) {
+            print(fb, "touch: path is not a file\n");
+        }
+        vfs_vnode_put(vn);
+        return;
+    }
+
+    if (!vfs_create(path, 0644u, &vn) || !vn) {
+        print(fb, "touch: create failed\n");
+        return;
+    }
+
+    vfs_vnode_put(vn);
+}
+
+static void cmd_mkdir_vfs(struct limine_framebuffer* fb, const char* args) {
+    const char* cur = trim_spaces(args);
+    char raw[256];
+    char path[256];
+
+    if (!copy_next_token(&cur, raw, sizeof(raw)) ||
+        !normalize_shell_path(raw, path, sizeof(path)) ||
+        *trim_spaces(cur) != '\0') {
+        print(fb, "Usage: mkdir <path>\n");
+        return;
+    }
+
+    if (!vfs_mkdir(path, 0755u)) {
+        print(fb, "mkdir: failed\n");
+    }
+}
+
+static void cmd_rm_vfs(struct limine_framebuffer* fb, const char* args) {
+    const char* cur = trim_spaces(args);
+    char raw[256];
+    char path[256];
+
+    if (!copy_next_token(&cur, raw, sizeof(raw)) ||
+        !normalize_shell_path(raw, path, sizeof(path)) ||
+        *trim_spaces(cur) != '\0') {
+        print(fb, "Usage: rm <path>\n");
+        return;
+    }
+
+    if (!vfs_unlink(path)) {
+        print(fb, "rm: failed\n");
+    }
+}
+
+static void cmd_cp_vfs(struct limine_framebuffer* fb, const char* args) {
+    const char* cur = trim_spaces(args);
+    char src_raw[256];
+    char dst_raw[256];
+    char src[256];
+    char dst[256];
+    char target[256];
+
+    if (!copy_next_token(&cur, src_raw, sizeof(src_raw)) ||
+        !copy_next_token(&cur, dst_raw, sizeof(dst_raw)) ||
+        !normalize_shell_path(src_raw, src, sizeof(src)) ||
+        !normalize_shell_path(dst_raw, dst, sizeof(dst)) ||
+        *trim_spaces(cur) != '\0') {
+        print(fb, "Usage: cp <src> <dst>\n");
+        return;
+    }
+
+    if (!resolve_copy_target_path(src, dst, target, sizeof(target))) {
+        print(fb, "cp: invalid destination\n");
+        return;
+    }
+
+    (void)copy_file_vfs(fb, src, target, false);
+}
+
+static void cmd_mv_vfs(struct limine_framebuffer* fb, const char* args) {
+    const char* cur = trim_spaces(args);
+    char src_raw[256];
+    char dst_raw[256];
+    char src[256];
+    char dst[256];
+    char target[256];
+
+    if (!copy_next_token(&cur, src_raw, sizeof(src_raw)) ||
+        !copy_next_token(&cur, dst_raw, sizeof(dst_raw)) ||
+        !normalize_shell_path(src_raw, src, sizeof(src)) ||
+        !normalize_shell_path(dst_raw, dst, sizeof(dst)) ||
+        *trim_spaces(cur) != '\0') {
+        print(fb, "Usage: mv <src> <dst>\n");
+        return;
+    }
+
+    if (!resolve_copy_target_path(src, dst, target, sizeof(target))) {
+        print(fb, "mv: invalid destination\n");
+        return;
+    }
+
+    (void)copy_file_vfs(fb, src, target, true);
+}
+
 static void cmd_exec(struct limine_framebuffer* fb, const char* args) {
-    const char* path = trim_spaces(args);
-    if (!path || !*path) {
+    const char* cur = trim_spaces(args);
+    char raw[256];
+    char path[256];
+
+    if (!copy_next_token(&cur, raw, sizeof(raw)) ||
+        !resolve_program_path(raw, path, sizeof(path)) ||
+        *trim_spaces(cur) != '\0') {
         print(fb, "Usage: exec <path>\n");
         return;
     }
@@ -1236,8 +1854,8 @@ static void cmd_exec(struct limine_framebuffer* fb, const char* args) {
         return;
     }
 
-    print(fb, "exec: entering ring 3...\n");
-    process_enter(proc);
+    print(fb, "exec: scheduling process...\n");
+    scheduler_run(proc);
 }
 
 static void cmd_usertest(struct limine_framebuffer* fb) {
@@ -1365,6 +1983,11 @@ static void execute_command(struct limine_framebuffer *fb, char *input) {
         return;
     }
 
+    if (strcmp(input, "rescan") == 0) {
+        cmd_rescan(fb);
+        return;
+    }
+
     if (strcmp(input, "diskreadp") == 0) {
         cmd_diskreadp(fb, args);
         return;
@@ -1415,6 +2038,16 @@ static void execute_command(struct limine_framebuffer *fb, char *input) {
         return;
     }
 
+    if (strcmp(input, "pwd") == 0) {
+        cmd_pwd(fb, args);
+        return;
+    }
+
+    if (strcmp(input, "cd") == 0) {
+        cmd_cd(fb, args);
+        return;
+    }
+
     if (strcmp(input, "ls") == 0) {
         cmd_ls(fb, args);
         return;
@@ -1427,6 +2060,31 @@ static void execute_command(struct limine_framebuffer *fb, char *input) {
 
     if (strcmp(input, "cat") == 0) {
         cmd_cat(fb, args);
+        return;
+    }
+
+    if (strcmp(input, "touch") == 0) {
+        cmd_touch(fb, args);
+        return;
+    }
+
+    if (strcmp(input, "mkdir") == 0) {
+        cmd_mkdir_vfs(fb, args);
+        return;
+    }
+
+    if (strcmp(input, "rm") == 0) {
+        cmd_rm_vfs(fb, args);
+        return;
+    }
+
+    if (strcmp(input, "cp") == 0) {
+        cmd_cp_vfs(fb, args);
+        return;
+    }
+
+    if (strcmp(input, "mv") == 0) {
+        cmd_mv_vfs(fb, args);
         return;
     }
 
@@ -1484,37 +2142,36 @@ static const char *history_fetch(int cursor_from_newest) {
     return history[logical % HISTORY_SIZE];
 }
 
-static void replace_input_line(struct limine_framebuffer *fb,
-                               char *buffer, int *pos,
+static void replace_input_line(char *buffer, int *len, int *cursor,
                                const char *text) {
-    while (*pos > 0) {
-        putc_fb(fb, '\b');
-        (*pos)--;
+    size_t text_len = strlen(text);
+    if (text_len >= INPUT_BUFFER_SIZE) {
+        text_len = INPUT_BUFFER_SIZE - 1;
     }
 
-    const char *p = text;
-    while (*p && *pos < INPUT_BUFFER_SIZE - 1) {
-        buffer[*pos] = *p;
-        putc_fb(fb, *p);
-        (*pos)++;
-        p++;
-    }
+    memcpy(buffer, text, text_len);
+    buffer[text_len] = '\0';
+    *len = (int)text_len;
+    *cursor = (int)text_len;
+    console_set_input_line("> ", buffer, (uint32_t)(*len), (uint32_t)(*cursor), true);
 }
 
 void shell_loop(struct limine_framebuffer *fb) {
     char input_buffer[INPUT_BUFFER_SIZE];
-    int input_pos = 0;
+    int input_len = 0;
+    int cursor_pos = 0;
+    input_buffer[0] = '\0';
     log_info("shell", "interactive shell started");
 
     print(fb, "Welcome to kiwiOS!\n");
     print(fb, "Type 'help' for available commands\n\n");
-    print(fb, "> ");
+    console_set_input_line("> ", input_buffer, 0, 0, true);
 
     while (1) {
-        char c = keyboard_getchar();
+        int c = keyboard_getchar();
         if (c == KEY_ARROW_UP) {
             if (history_cursor == -1) {
-                history_scratch_len = input_pos;
+                history_scratch_len = input_len;
                 if (history_scratch_len > INPUT_BUFFER_SIZE - 1) history_scratch_len = INPUT_BUFFER_SIZE - 1;
                 memcpy(history_scratch, input_buffer, (size_t)history_scratch_len);
                 history_scratch[history_scratch_len] = '\0';
@@ -1523,7 +2180,7 @@ void shell_loop(struct limine_framebuffer *fb) {
             if (history_cursor + 1 < history_count) {
                 history_cursor++;
                 const char *entry = history_fetch(history_cursor);
-                if (entry) replace_input_line(fb, input_buffer, &input_pos, entry);
+                if (entry) replace_input_line(input_buffer, &input_len, &cursor_pos, entry);
             }
             continue;
         }
@@ -1532,38 +2189,67 @@ void shell_loop(struct limine_framebuffer *fb) {
             if (history_cursor > 0) {
                 history_cursor--;
                 const char *entry = history_fetch(history_cursor);
-                if (entry) replace_input_line(fb, input_buffer, &input_pos, entry);
+                if (entry) replace_input_line(input_buffer, &input_len, &cursor_pos, entry);
             } else if (history_cursor == 0) {
                 history_cursor = -1;
-                replace_input_line(fb, input_buffer, &input_pos, history_scratch);
+                replace_input_line(input_buffer, &input_len, &cursor_pos, history_scratch);
+            }
+            continue;
+        }
+
+        if (c == KEY_ARROW_LEFT) {
+            if (cursor_pos > 0) {
+                cursor_pos--;
+                console_set_input_line("> ", input_buffer, (uint32_t)input_len, (uint32_t)cursor_pos, true);
+            }
+            continue;
+        }
+
+        if (c == KEY_ARROW_RIGHT) {
+            if (cursor_pos < input_len) {
+                cursor_pos++;
+                console_set_input_line("> ", input_buffer, (uint32_t)input_len, (uint32_t)cursor_pos, true);
             }
             continue;
         }
 
         if (c == '\n') {
             // Execute command
+            console_set_input_line("> ", input_buffer, (uint32_t)input_len, (uint32_t)input_len, false);
             print(fb, "\n");
-            input_buffer[input_pos] = '\0';
+            input_buffer[input_len] = '\0';
 
-            if (input_pos > 0) {
+            if (input_len > 0) {
                 history_record(input_buffer);
                 execute_command(fb, input_buffer);
             }
 
             // Reset for next command
-            input_pos = 0;
-            print(fb, "> ");
+            input_len = 0;
+            cursor_pos = 0;
             reset_history_navigation();
+            console_set_input_line("> ", input_buffer, 0, 0, true);
         } else if (c == '\b') {
             // Backspace
-            if (input_pos > 0) {
-                input_pos--;
-                putc_fb(fb, '\b');
+            if (cursor_pos > 0) {
+                memmove(&input_buffer[cursor_pos - 1],
+                        &input_buffer[cursor_pos],
+                        (size_t)(input_len - cursor_pos));
+                input_len--;
+                cursor_pos--;
+                input_buffer[input_len] = '\0';
+                console_set_input_line("> ", input_buffer, (uint32_t)input_len, (uint32_t)cursor_pos, true);
             }
-        } else if (input_pos < INPUT_BUFFER_SIZE - 1) {
+        } else if (c >= 0 && input_len < INPUT_BUFFER_SIZE - 1) {
             // Add character to buffer
-            input_buffer[input_pos++] = c;
-            putc_fb(fb, c);
+            memmove(&input_buffer[cursor_pos + 1],
+                    &input_buffer[cursor_pos],
+                    (size_t)(input_len - cursor_pos));
+            input_buffer[cursor_pos] = (char)c;
+            input_len++;
+            cursor_pos++;
+            input_buffer[input_len] = '\0';
+            console_set_input_line("> ", input_buffer, (uint32_t)input_len, (uint32_t)cursor_pos, true);
         }
     }
 }

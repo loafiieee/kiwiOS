@@ -4,9 +4,11 @@
 #include "arch/x86/io.h"
 #include "core/console.h"
 #include "core/keyboard.h"
+#include "core/scheduler.h"
 
 #define PS2_DATA_PORT 0x60
 #define PS2_STATUS_PORT 0x64
+#define KEYBOARD_BUFFER_SIZE 256u
 
 // US QWERTY scancode set 1 -> ASCII mapping
 static const char scancode_to_ascii[] = {
@@ -38,7 +40,12 @@ static const char scancode_to_ascii_shift[] = {
 static bool shift_pressed = false;
 static bool ctrl_pressed  = false;
 static bool e0_prefix     = false;
-static int  pending_special = -1;
+static int g_keybuf[KEYBOARD_BUFFER_SIZE];
+static uint32_t g_keybuf_head = 0;
+static uint32_t g_keybuf_tail = 0;
+static uint32_t g_keybuf_count = 0;
+static process_t* g_wait_head = NULL;
+static process_t* g_wait_tail = NULL;
 
 // Helpers for scancode press/release
 static inline bool is_shift_press(uint8_t s)   { return s == 0x2A || s == 0x36; }
@@ -55,107 +62,156 @@ static inline char maybe_ctrlify(char c) {
     return c;
 }
 
-static bool handle_extended_scancode(uint8_t scancode) {
-    if (scancode & 0x80) return true; // ignore extended releases
-
-    switch (scancode) {
-        case 0x49: console_page_up();   return true;
-        case 0x51: console_page_down(); return true;
-        case 0x48: pending_special = KEY_ARROW_UP;   return true; // Up arrow
-        case 0x50: pending_special = KEY_ARROW_DOWN; return true; // Down arrow
-        default:   return false;
+static void keybuf_push(int ch) {
+    if (g_keybuf_count >= KEYBOARD_BUFFER_SIZE) {
+        return;
     }
+
+    g_keybuf[g_keybuf_tail] = ch;
+    g_keybuf_tail = (g_keybuf_tail + 1u) % KEYBOARD_BUFFER_SIZE;
+    g_keybuf_count++;
 }
 
-char keyboard_getchar(void) {
-    if (pending_special != -1) {
-        char k = (char)pending_special;
-        pending_special = -1;
-        return k;
+static int keybuf_pop(void) {
+    int ch = -1;
+    if (g_keybuf_count == 0) {
+        return -1;
     }
 
-    for (;;) {
-        // Data available?
-        uint8_t status = inb(PS2_STATUS_PORT);
-        if (!(status & 0x01)) continue;
-
-        uint8_t scancode = inb(PS2_DATA_PORT);
-
-        if (scancode == 0xE0) { e0_prefix = true; continue; }
-        if (e0_prefix) {
-            bool consumed = handle_extended_scancode(scancode);
-            e0_prefix = false;
-            if (consumed) {
-                if (pending_special != -1) {
-                    char k = (char)pending_special;
-                    pending_special = -1;
-                    return k;
-                }
-                continue;
-            }
-        }
-
-        // Track modifiers
-        if (is_shift_press(scancode))   { shift_pressed = true;  continue; }
-        if (is_shift_release(scancode)) { shift_pressed = false; continue; }
-        if (is_ctrl_press(scancode))    { ctrl_pressed  = true;  continue; }
-        if (is_ctrl_release(scancode))  { ctrl_pressed  = false; continue; }
-
-        // Ignore generic key releases
-        if (scancode & 0x80) continue;
-
-        // Map to ASCII and optionally ctrlify
-        if (scancode < sizeof(scancode_to_ascii)) {
-            char c = shift_pressed ? scancode_to_ascii_shift[scancode]
-                                   : scancode_to_ascii[scancode];
-            if (c != 0) return maybe_ctrlify(c);
-        }
-    }
+    ch = g_keybuf[g_keybuf_head];
+    g_keybuf_head = (g_keybuf_head + 1u) % KEYBOARD_BUFFER_SIZE;
+    g_keybuf_count--;
+    return ch;
 }
 
-int keyboard_getchar_nonblocking(void) {
-    if (pending_special != -1) {
-        char k = (char)pending_special;
-        pending_special = -1;
-        return (int)k;
+static process_t* keyboard_wait_pop(void) {
+    process_t* proc = g_wait_head;
+    if (!proc) {
+        return NULL;
     }
 
-    // Any data?
-    uint8_t status = inb(PS2_STATUS_PORT);
-    if (!(status & 0x01)) return -1;
+    g_wait_head = proc->next;
+    if (!g_wait_head) {
+        g_wait_tail = NULL;
+    }
 
-    uint8_t scancode = inb(PS2_DATA_PORT);
+    proc->next = NULL;
+    return proc;
+}
 
-    if (scancode == 0xE0) { e0_prefix = true; return -1; }
+static int translate_scancode(uint8_t scancode) {
+    if (scancode == 0xE0) {
+        e0_prefix = true;
+        return -1;
+    }
+
     if (e0_prefix) {
-        bool consumed = handle_extended_scancode(scancode);
         e0_prefix = false;
-        if (consumed) {
-            if (pending_special != -1) {
-                char k = (char)pending_special;
-                pending_special = -1;
-                return (int)k;
-            }
+        if (scancode & 0x80) {
             return -1;
         }
+
+        switch (scancode) {
+            case 0x49:
+                console_page_up();
+                return -1;
+            case 0x51:
+                console_page_down();
+                return -1;
+            case 0x48:
+                return KEY_ARROW_UP;
+            case 0x50:
+                return KEY_ARROW_DOWN;
+            case 0x4B:
+                return KEY_ARROW_LEFT;
+            case 0x4D:
+                return KEY_ARROW_RIGHT;
+            default:
+                return -1;
+        }
     }
 
-    // Track modifiers
     if (is_shift_press(scancode))   { shift_pressed = true;  return -1; }
     if (is_shift_release(scancode)) { shift_pressed = false; return -1; }
     if (is_ctrl_press(scancode))    { ctrl_pressed  = true;  return -1; }
     if (is_ctrl_release(scancode))  { ctrl_pressed  = false; return -1; }
 
-    // Ignore generic key releases
-    if (scancode & 0x80) return -1;
+    if (scancode & 0x80) {
+        return -1;
+    }
 
-    // Map to ASCII and optionally ctrlify
     if (scancode < sizeof(scancode_to_ascii)) {
         char c = shift_pressed ? scancode_to_ascii_shift[scancode]
                                : scancode_to_ascii[scancode];
-        if (c != 0) return (int)maybe_ctrlify(c);
+        if (c != 0) {
+            return (int)maybe_ctrlify(c);
+        }
     }
+
     return -1;
+}
+
+static bool interrupts_enabled(void) {
+    uint64_t rflags = 0;
+    asm volatile("pushfq; pop %0" : "=r"(rflags));
+    return (rflags & (1ull << 9)) != 0;
+}
+
+void keyboard_enqueue_waiter(process_t* proc) {
+    if (!proc) {
+        return;
+    }
+
+    proc->next = NULL;
+    if (g_wait_tail) {
+        g_wait_tail->next = proc;
+    } else {
+        g_wait_head = proc;
+    }
+    g_wait_tail = proc;
+}
+
+void keyboard_interrupt_handler(void) {
+    for (;;) {
+        uint8_t status = inb(PS2_STATUS_PORT);
+        if (!(status & 0x01)) {
+            break;
+        }
+
+        int ch = translate_scancode(inb(PS2_DATA_PORT));
+        if (ch == -1) {
+            continue;
+        }
+
+        keybuf_push(ch);
+
+        process_t* proc = keyboard_wait_pop();
+        if (proc) {
+            scheduler_add(proc);
+        }
+    }
+}
+
+int keyboard_getchar(void) {
+    for (;;) {
+        int ch = keybuf_pop();
+        if (ch >= 0) {
+            return ch;
+        }
+
+        if (ch == KEY_ARROW_UP || ch == KEY_ARROW_DOWN ||
+            ch == KEY_ARROW_LEFT || ch == KEY_ARROW_RIGHT) {
+            return ch;
+        }
+
+        if (interrupts_enabled()) {
+            asm volatile("hlt");
+        }
+    }
+}
+
+int keyboard_getchar_nonblocking(void) {
+    return keybuf_pop();
 }
 
 void wait_for_key(void) {

@@ -3,6 +3,7 @@
 #include "core/log.h"
 #include "libc/crc32.h"
 #include "libc/string.h"
+#include "memory/heap.h"
 #include "memory/pmm.h"
 #include "memory/vmm.h"
 #include "vfs/vfs.h"
@@ -333,9 +334,9 @@ static bool kxe_load_section(process_t* proc, vnode_t* file, const kxe_section_t
 
 process_t* kxe_load(const char* path) {
     vnode_t* file = NULL;
-    uint8_t header_page[KXE_HEADER_PAGE_SIZE];
     uint64_t stack_base = KXE_USER_STACK_TOP - ((uint64_t)KXE_USER_STACK_PAGES * PAGE_SIZE);
-    kxe_image_t image;
+    uint8_t* header_page = NULL;
+    kxe_image_t* image = NULL;
     process_t* proc = NULL;
 
     if (!path || path[0] != '/') {
@@ -354,19 +355,39 @@ process_t* kxe_load(const char* path) {
         return NULL;
     }
 
-    if (!vnode_read_exact(file, 0, header_page, sizeof(header_page))) {
+    header_page = (uint8_t*)kmalloc(KXE_HEADER_PAGE_SIZE);
+    image = (kxe_image_t*)kmalloc(sizeof(*image));
+    if (!header_page || !image) {
+        log_error("kxe", "Out of memory allocating loader scratch buffers");
+        if (header_page) {
+            kfree(header_page);
+        }
+        if (image) {
+            kfree(image);
+        }
+        vfs_vnode_put(file);
+        return NULL;
+    }
+
+    if (!vnode_read_exact(file, 0, header_page, KXE_HEADER_PAGE_SIZE)) {
         log_errorf("kxe", "Failed to read KXE header page from %s", path);
+        kfree(image);
+        kfree(header_page);
         vfs_vnode_put(file);
         return NULL;
     }
 
-    if (!kxe_validate(header_page, file->size, &image)) {
+    if (!kxe_validate(header_page, file->size, image)) {
+        kfree(image);
+        kfree(header_page);
         vfs_vnode_put(file);
         return NULL;
     }
 
-    if (image.header.image_max_vaddr > stack_base) {
+    if (image->header.image_max_vaddr > stack_base) {
         log_error("kxe", "KXE image overlaps the fixed user stack region");
+        kfree(image);
+        kfree(header_page);
         vfs_vnode_put(file);
         return NULL;
     }
@@ -374,13 +395,17 @@ process_t* kxe_load(const char* path) {
     proc = process_create(path_basename(path));
     if (!proc) {
         log_error("kxe", "Failed to create process for KXE image");
+        kfree(image);
+        kfree(header_page);
         vfs_vnode_put(file);
         return NULL;
     }
 
-    for (uint16_t i = 0; i < image.header.section_count; i++) {
-        if (!kxe_load_section(proc, file, &image.sections[i])) {
+    for (uint16_t i = 0; i < image->header.section_count; i++) {
+        if (!kxe_load_section(proc, file, &image->sections[i])) {
             log_errorf("kxe", "Failed to load section %u from %s", (unsigned)i, path);
+            kfree(image);
+            kfree(header_page);
             vfs_vnode_put(file);
             process_destroy(proc);
             return NULL;
@@ -389,18 +414,22 @@ process_t* kxe_load(const char* path) {
 
     if (!process_map_user_stack(proc, KXE_USER_STACK_TOP, KXE_USER_STACK_PAGES)) {
         log_error("kxe", "Failed to map user stack for KXE image");
+        kfree(image);
+        kfree(header_page);
         vfs_vnode_put(file);
         process_destroy(proc);
         return NULL;
     }
 
-    proc->saved_rip = image.header.entry_vaddr;
-    proc->saved_rsp = KXE_USER_STACK_TOP;
-    proc->saved_rflags = 0x202;
-    proc->brk_base = PAGE_ALIGN_UP(image.header.image_max_vaddr);
+    proc->context.rip = image->header.entry_vaddr;
+    proc->context.rsp = KXE_USER_STACK_TOP;
+    proc->context.rflags = 0x202;
+    proc->brk_base = PAGE_ALIGN_UP(image->header.image_max_vaddr);
     proc->brk_current = proc->brk_base;
     proc->state = PROC_READY;
 
+    kfree(image);
+    kfree(header_page);
     vfs_vnode_put(file);
     return proc;
 }

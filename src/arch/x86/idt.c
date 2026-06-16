@@ -2,6 +2,8 @@
 #include <stddef.h>
 #include "arch/x86/idt.h"
 #include "core/console.h"
+#include "core/keyboard.h"
+#include "core/scheduler.h"
 #include "libc/string.h"
 #include "drivers/serial/serial.h"
 
@@ -74,18 +76,51 @@ __attribute__((noreturn)) static void panic_halt_forever(void) {
     for (;;) asm volatile("hlt");
 }
 
+static void panic_dump_serial(const struct exception_frame *frame) {
+    if (!g_serial_enabled || !frame) {
+        return;
+    }
+
+    serial_write("\n>w< Whoops! You broke the kernel!\n");
+    serial_write("=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=\n\n");
+    serial_write("Exception: ");
+    if (frame->int_no < 32) {
+        serial_write(exception_messages[frame->int_no]);
+    } else {
+        serial_write("Unknown Exception");
+    }
+    serial_write("\n");
+    serial_write("Exception Number: "); serial_print_hex(frame->int_no); serial_write("\n");
+    serial_write("Error Code: ");       serial_print_hex(frame->error_code); serial_write("\n\n");
+
+    serial_write("Register Dump:\n");
+    serial_write("RIP: "); serial_print_hex(frame->rip);    serial_write("   CS: ");    serial_print_hex(frame->cs);     serial_write("\n");
+    serial_write("RSP: "); serial_print_hex(frame->rsp);    serial_write("   SS: ");    serial_print_hex(frame->ss);     serial_write("\n");
+    serial_write("RFLAGS: "); serial_print_hex(frame->rflags);                        serial_write("\n");
+    serial_write("RBP: "); serial_print_hex(frame->rbp);    serial_write("   CR2: ");   {
+        uint64_t cr2 = 0; asm volatile("mov %%cr2, %0" : "=r"(cr2)); serial_print_hex(cr2);
+    }           serial_write("\n");
+    serial_write("RAX: "); serial_print_hex(frame->rax);    serial_write("   RBX: ");   serial_print_hex(frame->rbx);    serial_write("\n");
+    serial_write("RCX: "); serial_print_hex(frame->rcx);    serial_write("   RDX: ");   serial_print_hex(frame->rdx);    serial_write("\n");
+    serial_write("RSI: "); serial_print_hex(frame->rsi);    serial_write("   RDI: ");   serial_print_hex(frame->rdi);    serial_write("\n");
+    serial_write("R8 : "); serial_print_hex(frame->r8);     serial_write("   R9 : ");   serial_print_hex(frame->r9);     serial_write("\n");
+    serial_write("R10: "); serial_print_hex(frame->r10);    serial_write("   R11: ");   serial_print_hex(frame->r11);    serial_write("\n");
+    serial_write("R12: "); serial_print_hex(frame->r12);    serial_write("   R13: ");   serial_print_hex(frame->r13);    serial_write("\n");
+    serial_write("R14: "); serial_print_hex(frame->r14);    serial_write("   R15: ");   serial_print_hex(frame->r15);    serial_write("\n");
+    serial_write("\nSystem Halted.\n");
+}
+
 // Kernel panic handler
 __attribute__((noinline)) void kernel_panic(struct exception_frame *frame) {
     uint32_t old_fg, old_bg;
+
+    panic_dump_serial(frame);
+
     console_get_colors(&old_fg, &old_bg);
 
-    // Set panic colors, then reset scrollback so the buffer uses panic colors
+    // Keep the framebuffer path simple during exception handling.
     console_set_colors(0x00FFFFFF, 0x00913030);
-    console_reset_scrollback();
-
-    // Ensure the scrollback buffer's visible lines use the panic bg
-    console_clear_outputs();
-    console_render_visible();
+    console_clear();
 
     print(NULL, "\n>w< Whoops! You broke the kernel!\n");
     print(NULL, "=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=\n\n");
@@ -119,38 +154,6 @@ __attribute__((noinline)) void kernel_panic(struct exception_frame *frame) {
     print(NULL, "R14: "); print_hex(NULL, frame->r14);    print(NULL, "   R15: ");   print_hex(NULL, frame->r15);    print(NULL, "\n");
 
     print(NULL, "\nSystem Halted.\n");
-
-    if (g_serial_enabled) {
-        serial_write("\n>w< Whoops! You broke the kernel!\n");
-        serial_write("=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=\n\n");
-        serial_write("Exception: ");
-        if (frame->int_no < 32) {
-            serial_write(exception_messages[frame->int_no]);
-        } else {
-            serial_write("Unknown Exception");
-        }
-        serial_write("\n");
-        serial_write("Exception Number: "); serial_print_hex(frame->int_no); serial_write("\n");
-        serial_write("Error Code: ");       serial_print_hex(frame->error_code); serial_write("\n\n");
-
-        serial_write("Register Dump:\n");
-        serial_write("RIP: "); serial_print_hex(frame->rip);    serial_write("   CS: ");    serial_print_hex(frame->cs);     serial_write("\n");
-        serial_write("RSP: "); serial_print_hex(frame->rsp);    serial_write("   SS: ");    serial_print_hex(frame->ss);     serial_write("\n");
-        serial_write("RFLAGS: "); serial_print_hex(frame->rflags);                        serial_write("\n");
-        serial_write("RBP: "); serial_print_hex(frame->rbp);    serial_write("   CR2: ");   {
-            uint64_t cr2 = 0; asm volatile("mov %%cr2, %0" : "=r"(cr2)); serial_print_hex(cr2);
-        }           serial_write("\n");
-        serial_write("RAX: "); serial_print_hex(frame->rax);    serial_write("   RBX: ");   serial_print_hex(frame->rbx);    serial_write("\n");
-        serial_write("RCX: "); serial_print_hex(frame->rcx);    serial_write("   RDX: ");   serial_print_hex(frame->rdx);    serial_write("\n");
-        serial_write("RSI: "); serial_print_hex(frame->rsi);    serial_write("   RDI: ");   serial_print_hex(frame->rdi);    serial_write("\n");
-        serial_write("R8 : "); serial_print_hex(frame->r8);     serial_write("   R9 : ");   serial_print_hex(frame->r9);     serial_write("\n");
-        serial_write("R10: "); serial_print_hex(frame->r10);    serial_write("   R11: ");   serial_print_hex(frame->r11);    serial_write("\n");
-        serial_write("R12: "); serial_print_hex(frame->r12);    serial_write("   R13: ");   serial_print_hex(frame->r13);    serial_write("\n");
-        serial_write("R14: "); serial_print_hex(frame->r14);    serial_write("   R15: ");   serial_print_hex(frame->r15);    serial_write("\n");
-
-        serial_write("\nSystem Halted.\n");
-
-    }
     
     console_set_colors(old_fg, old_bg);
     panic_halt_forever();
@@ -246,14 +249,60 @@ __attribute__((naked)) void irq0_handler(void) {
         "push %r13\n"
         "push %r14\n"
         "push %r15\n"
-        
+
         "mov %rsp, %rdi\n"  // Pass pointer to interrupt frame
-        
-        // Send EOI to PIC (AT&T: use DX as the port register)
+
+        // Send EOI before any potential context switch.
         "mov $0x20, %al\n"
         "mov $0x20, %dx\n"
         "out %al, (%dx)\n"
-        
+
+        "call console_timer_tick\n"
+        "call scheduler_timer_tick\n"
+
+        "pop %r15\n"
+        "pop %r14\n"
+        "pop %r13\n"
+        "pop %r12\n"
+        "pop %r11\n"
+        "pop %r10\n"
+        "pop %r9\n"
+        "pop %r8\n"
+        "pop %rbp\n"
+        "pop %rdi\n"
+        "pop %rsi\n"
+        "pop %rdx\n"
+        "pop %rcx\n"
+        "pop %rbx\n"
+        "pop %rax\n"
+        "iretq\n"
+    );
+}
+
+__attribute__((naked)) void irq1_handler(void) {
+    asm volatile (
+        "push %rax\n"
+        "push %rbx\n"
+        "push %rcx\n"
+        "push %rdx\n"
+        "push %rsi\n"
+        "push %rdi\n"
+        "push %rbp\n"
+        "push %r8\n"
+        "push %r9\n"
+        "push %r10\n"
+        "push %r11\n"
+        "push %r12\n"
+        "push %r13\n"
+        "push %r14\n"
+        "push %r15\n"
+
+        "call keyboard_interrupt_handler\n"
+
+        "mov $0x20, %al\n"
+        "mov $0x20, %dx\n"
+        "out %al, (%dx)\n"
+
         "pop %r15\n"
         "pop %r14\n"
         "pop %r13\n"
@@ -360,9 +409,11 @@ void init_idt(void) {
     idt_set_gate(19, (uint64_t)exception_19);
     idt_set_gate(20, (uint64_t)exception_20);
     idt_set_gate(21, (uint64_t)exception_21);
+    idt[8].ist = 1; // Double fault gets a dedicated IST stack.
     
     // Timer IRQ (IRQ 0 = interrupt 32)
     idt_set_gate(32, (uint64_t)irq0_handler);
+    idt_set_gate(33, (uint64_t)irq1_handler);
 
     // After setting up all exception handlers, set syscall differently:
     idt[0x80].type_attr = 0xEE; // Change to DPL=3 (ring 3 can call)

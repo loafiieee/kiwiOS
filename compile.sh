@@ -8,13 +8,138 @@ make -C tools clean
 make -C userspace clean
 make
 
-make -C tools
-make -C userspace
+make -C tools all
+make -C userspace all
 
-if [ -f "disk_gpt.img" ]; then
-  ./tools/kifs_cp disk_gpt.img 1 userspace/bin/hello /hello
-  ./tools/kifs_cp disk_gpt.img 1 userspace/bin/badptr /badptr
-  ./tools/kifs_cp disk_gpt.img 1 userspace/bin/filetest /filetest
+DISK_IMAGE="disk.img"
+DISK_ATTACH_OK=0
+DISK_INSTALL_OK=0
+
+ensure_disk_image() {
+  local img="$1"
+  local size="${KIWI_DISK_SIZE:-10G}"
+
+  if [ -f "$img" ]; then
+    return 0
+  fi
+
+  echo "[*] Creating $img ($size)"
+  truncate -s "$size" "$img"
+}
+
+ensure_gpt_partition() {
+  local img="$1"
+
+  if sgdisk -i 1 "$img" >/dev/null 2>&1; then
+    return 0
+  fi
+
+  if ! command -v sgdisk >/dev/null 2>&1; then
+    echo "[!] $img does not have a usable GPT partition 1, and sgdisk is not installed." >&2
+    echo "[!] Boot will continue, but in-guest mkfs.kifs will not work until the disk has a GPT partition." >&2
+    return 1
+  fi
+
+  echo "[*] Rebuilding GPT partition table on $img"
+  sgdisk -Z "$img" >/dev/null 2>&1 || true
+  sgdisk -og "$img" >/dev/null
+  sgdisk -n 1:2048:0 -t 1:8300 -c 1:KiwiOS "$img" >/dev/null
+
+  if ! sgdisk -i 1 "$img" >/dev/null 2>&1; then
+    echo "[!] Failed to create GPT partition 1 on $img" >&2
+    return 1
+  fi
+
+  return 0
+}
+
+prepare_disk_image() {
+  local img="$1"
+
+  if ! ensure_disk_image "$img"; then
+    echo "[!] Failed to create $img. Boot will continue without a usable disk image." >&2
+    return 1
+  fi
+
+  DISK_ATTACH_OK=1
+
+  if ! ensure_gpt_partition "$img"; then
+    echo "[!] $img is not ready for KiFS installs. Booting anyway for recovery." >&2
+    return 0
+  fi
+
+  if ./tools/mkfs_kifs --check "$img" 1 >/dev/null 2>&1; then
+    DISK_INSTALL_OK=1
+    return 0
+  fi
+
+  echo "[!] $img partition 1 is not a valid KiFS filesystem." >&2
+  echo "[!] Boot will continue so you can recover it from the kernel shell with mkfs.kifs." >&2
+  return 0
+}
+
+install_program() {
+  local src="$1"
+  local dst="$2"
+
+  if ./tools/kifs_cp "$DISK_IMAGE" 1 "$src" "$dst"; then
+    return 0
+  fi
+
+  echo "[!] Failed to install $src to $dst; booting anyway." >&2
+  return 1
+}
+
+install_program_specs() {
+  local failures=0
+  local spec src dst
+
+  for spec in "$@"; do
+    src="${spec%%:*}"
+    dst="${spec#*:}"
+    if ! install_program "$src" "$dst"; then
+      failures=$((failures + 1))
+    fi
+  done
+
+  INSTALL_PROGRAM_FAILURES="$failures"
+  return "$failures"
+}
+
+prepare_disk_image "$DISK_IMAGE"
+
+if [ "$DISK_INSTALL_OK" = "1" ]; then
+  if ! install_program_specs \
+    "userspace/bin/init:/bin/init" \
+    "userspace/bin/shell:/bin/sh" \
+    "userspace/bin/hello:/bin/hello" \
+    "userspace/bin/badptr:/bin/badptr" \
+    "userspace/bin/filetest:/bin/filetest" \
+    "userspace/bin/readtest:/bin/readtest" \
+    "userspace/bin/writetest:/bin/writetest" \
+    "userspace/bin/preempt_a:/bin/preempt_a" \
+    "userspace/bin/preempt_b:/bin/preempt_b" \
+    "userspace/bin/preempttest:/bin/preempttest"; then
+    BIN_INSTALL_FAILURES="$INSTALL_PROGRAM_FAILURES"
+    echo "[!] $BIN_INSTALL_FAILURES /bin userspace install(s) failed; trying legacy root-level fallback." >&2
+
+    if ! install_program_specs \
+      "userspace/bin/init:/init" \
+      "userspace/bin/shell:/shell" \
+      "userspace/bin/hello:/hello" \
+      "userspace/bin/badptr:/badptr" \
+      "userspace/bin/filetest:/filetest" \
+      "userspace/bin/readtest:/readtest" \
+      "userspace/bin/writetest:/writetest" \
+      "userspace/bin/preempt_a:/preempt_a" \
+      "userspace/bin/preempt_b:/preempt_b" \
+      "userspace/bin/preempttest:/preempttest"; then
+      LEGACY_INSTALL_FAILURES="$INSTALL_PROGRAM_FAILURES"
+      echo "[!] $LEGACY_INSTALL_FAILURES legacy userspace install(s) failed; continuing to boot for recovery." >&2
+    fi
+  fi
+else
+  echo "[*] Skipping userspace program install into $DISK_IMAGE"
 fi
 
 # Download the latest Limine binary release for the 10.x branch, only if it doesn't exist.

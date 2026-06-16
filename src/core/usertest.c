@@ -3,6 +3,7 @@
 #include <stdint.h>
 #include "core/console.h"
 #include "core/process.h"
+#include "core/scheduler.h"
 #include "core/usertest.h"
 #include "libc/string.h"
 #include "memory/pmm.h"
@@ -51,12 +52,12 @@ void usertest_run(struct limine_framebuffer* fb) {
         return;
     }
 
-    proc->saved_rip = USER_TEST_CODE_BASE;
-    proc->saved_rsp = USER_TEST_STACK_TOP;
-    proc->saved_rflags = 0x202;
+    proc->context.rip = USER_TEST_CODE_BASE;
+    proc->context.rsp = USER_TEST_STACK_TOP;
+    proc->context.rflags = 0x202;
     proc->brk_base = PAGE_ALIGN_UP(USER_TEST_CODE_BASE + (uint64_t)program_size);
     proc->brk_current = proc->brk_base;
 
-    print(fb, "usertest: entering ring 3...\n");
-    process_enter(proc);
+    print(fb, "usertest: scheduling ring 3 test...\n");
+    scheduler_run(proc);
 }
