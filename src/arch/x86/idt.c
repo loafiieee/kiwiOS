@@ -4,6 +4,7 @@
 #include "core/console.h"
 #include "core/keyboard.h"
 #include "core/scheduler.h"
+#include "core/time.h"
 #include "libc/string.h"
 #include "drivers/serial/serial.h"
 
@@ -258,6 +259,8 @@ __attribute__((naked)) void irq0_handler(void) {
         "out %al, (%dx)\n"
 
         "call console_timer_tick\n"
+        "call time_timer_tick\n"
+        "mov %rsp, %rdi\n"
         "call scheduler_timer_tick\n"
 
         "pop %r15\n"

@@ -1,5 +1,6 @@
 #include <stddef.h>
 #include <stdint.h>
+#include "glob.h"
 #include "kiwi_syscall.h"
 #include "string.h"
 
@@ -7,6 +8,7 @@
 #define PATH_BUFFER_SIZE 256u
 #define IO_BUFFER_SIZE 256u
 #define HISTORY_SIZE 32u
+#define PROGRAM_ARG_MAX 32u
 
 enum {
     SHELL_KEY_ARROW_UP = 0x100,
@@ -37,26 +39,6 @@ static void write_str(const char* s) {
 static void write_line(const char* s) {
     write_str(s);
     write_str("\n");
-}
-
-static void write_u64(uint64_t value) {
-    char buf[32];
-    size_t i = 0;
-
-    if (value == 0) {
-        write_str("0");
-        return;
-    }
-
-    while (value != 0 && i < sizeof(buf)) {
-        buf[i++] = (char)('0' + (value % 10u));
-        value /= 10u;
-    }
-
-    while (i > 0) {
-        i--;
-        write_bytes(&buf[i], 1);
-    }
 }
 
 static char* skip_spaces(char* s) {
@@ -237,6 +219,8 @@ static int read_key(void) {
 static char* next_arg(char** cursor) {
     char* s = NULL;
     char* start = NULL;
+    char* out = NULL;
+    char quote = '\0';
 
     if (!cursor || !*cursor) {
         return NULL;
@@ -249,13 +233,41 @@ static char* next_arg(char** cursor) {
     }
 
     start = s;
-    while (*s && *s != ' ' && *s != '\t') {
-        s++;
+    out = s;
+    while (*s) {
+        if (quote) {
+            if (*s == quote) {
+                quote = '\0';
+                s++;
+                continue;
+            }
+            if (quote == '"' && *s == '\\' && s[1] != '\0') {
+                s++;
+            }
+            *out++ = *s++;
+            continue;
+        }
+
+        if (*s == ' ' || *s == '\t') {
+            break;
+        }
+
+        if (*s == '"' || *s == '\'') {
+            quote = *s++;
+            continue;
+        }
+
+        if (*s == '\\' && s[1] != '\0') {
+            s++;
+        }
+
+        *out++ = *s++;
     }
 
     if (*s != '\0') {
-        *s++ = '\0';
+        s++;
     }
+    *out = '\0';
 
     *cursor = s;
     return start;
@@ -440,6 +452,60 @@ static int resolve_program_path(const char* cmd, char* out, size_t out_size) {
     return -1;
 }
 
+static int shell_arg_has_glob_magic(const char* s) {
+    for (; s && *s; s++) {
+        if (*s == '*' || *s == '?' || *s == '[') {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static int append_program_arg(const char** argv,
+                              int* argc,
+                              char expanded[PROGRAM_ARG_MAX][PATH_BUFFER_SIZE],
+                              int* expanded_count,
+                              const char* arg) {
+    glob_t g;
+
+    if (!argv || !argc || !expanded || !expanded_count || !arg) {
+        return -1;
+    }
+
+    if (!shell_arg_has_glob_magic(arg)) {
+        if (*argc >= (int)PROGRAM_ARG_MAX) {
+            return -1;
+        }
+        argv[(*argc)++] = arg;
+        return 0;
+    }
+
+    memset(&g, 0, sizeof(g));
+    if (glob(arg, 0, NULL, &g) != 0) {
+        globfree(&g);
+        if (*argc >= (int)PROGRAM_ARG_MAX) {
+            return -1;
+        }
+        argv[(*argc)++] = arg;
+        return 0;
+    }
+
+    for (size_t i = 0; i < g.gl_pathc; i++) {
+        size_t len = strlen(g.gl_pathv[i]);
+        if (*argc >= (int)PROGRAM_ARG_MAX || *expanded_count >= (int)PROGRAM_ARG_MAX ||
+            len + 1u > PATH_BUFFER_SIZE) {
+            globfree(&g);
+            return -1;
+        }
+        memcpy(expanded[*expanded_count], g.gl_pathv[i], len + 1u);
+        argv[(*argc)++] = expanded[*expanded_count];
+        (*expanded_count)++;
+    }
+
+    globfree(&g);
+    return 0;
+}
+
 static int stat_path(const char* path, kiwi_stat_t* out) {
     if (!path || !out) {
         return -1;
@@ -455,164 +521,25 @@ static int path_is_dir(const char* path) {
     return stat_path(path, &st) == 0 && st.type == KIWI_VNODE_DIR;
 }
 
-static const char* path_basename(const char* path) {
-    const char* last = NULL;
-
-    if (!path || !*path) {
-        return NULL;
-    }
-
-    last = path;
-    while (*path) {
-        if (*path == '/' && path[1] != '\0') {
-            last = path + 1;
-        }
-        path++;
-    }
-
-    return last;
-}
-
-static int resolve_copy_target_path(const char* src_path,
-                                    const char* dst_path,
-                                    char* out,
-                                    size_t out_size) {
-    const char* base = NULL;
-    size_t dst_len = 0;
-    size_t base_len = 0;
-
-    if (!src_path || !dst_path || !out || out_size < 2) {
-        return -1;
-    }
-
-    if (!path_is_dir(dst_path)) {
-        dst_len = strlen(dst_path);
-        if (dst_len + 1 > out_size) {
-            return -1;
-        }
-        memcpy(out, dst_path, dst_len + 1);
-        return 0;
-    }
-
-    base = path_basename(src_path);
-    if (!base || !*base) {
-        return -1;
-    }
-
-    dst_len = strlen(dst_path);
-    base_len = strlen(base);
-    if (dst_len == 0) {
-        return -1;
-    }
-
-    if (streq(dst_path, "/")) {
-        if (1 + base_len + 1 > out_size) {
-            return -1;
-        }
-        out[0] = '/';
-        memcpy(out + 1, base, base_len + 1);
-        return 0;
-    }
-
-    if (dst_len + 1 + base_len + 1 > out_size) {
-        return -1;
-    }
-
-    memcpy(out, dst_path, dst_len);
-    out[dst_len] = '/';
-    memcpy(out + dst_len + 1, base, base_len + 1);
-    return 0;
-}
-
 static void init_cwd(void) {
     static const char home_dir[] = "/home";
 
     if (path_is_dir(home_dir)) {
         memcpy(g_cwd, home_dir, sizeof(home_dir));
+        (void)sys_chdir(g_cwd);
         return;
     }
 
     g_cwd[0] = '/';
     g_cwd[1] = '\0';
-}
-
-static void write_stat_line(const kiwi_stat_t* st) {
-    if (!st) {
-        return;
-    }
-
-    write_str("ino=");
-    write_u64(st->ino);
-    write_str(" type=");
-    if (st->type == KIWI_VNODE_DIR) {
-        write_str("dir");
-    } else if (st->type == KIWI_VNODE_FILE) {
-        write_str("file");
-    } else {
-        write_str("unknown");
-    }
-    write_str(" size=");
-    write_u64(st->size);
-    write_str(" links=");
-    write_u64(st->link_count);
-    write_str("\n");
-}
-
-static int copy_file_contents(const char* src_path, const char* dst_path) {
-    char buf[IO_BUFFER_SIZE];
-    int64_t src_fd = -1;
-    int64_t dst_fd = -1;
-
-    if (!src_path || !dst_path || streq(src_path, dst_path)) {
-        return -1;
-    }
-
-    src_fd = sys_open(src_path, KIWI_O_RDONLY);
-    if (src_fd < 0) {
-        return -1;
-    }
-
-    dst_fd = sys_open(dst_path, KIWI_O_WRONLY | KIWI_O_CREAT | KIWI_O_TRUNC);
-    if (dst_fd < 0) {
-        (void)sys_close((int)src_fd);
-        return -1;
-    }
-
-    for (;;) {
-        int64_t n = sys_read((int)src_fd, buf, sizeof(buf));
-        if (n < 0) {
-            (void)sys_close((int)src_fd);
-            (void)sys_close((int)dst_fd);
-            (void)sys_unlink(dst_path);
-            return -1;
-        }
-        if (n == 0) {
-            break;
-        }
-        if (sys_write((int)dst_fd, buf, (uint64_t)n) != n) {
-            (void)sys_close((int)src_fd);
-            (void)sys_close((int)dst_fd);
-            (void)sys_unlink(dst_path);
-            return -1;
-        }
-    }
-
-    (void)sys_close((int)src_fd);
-    (void)sys_close((int)dst_fd);
-    return 0;
+    (void)sys_chdir(g_cwd);
 }
 
 static void show_help(void) {
-    write_line("Built-ins: help echo clear pwd cd ls stat cat touch mkdir rm cp mv mount rescan which exit");
-}
-
-static void cmd_pwd(char* rest) {
-    if (has_extra_args(rest)) {
-        write_line("usage: pwd");
-        return;
-    }
-
-    write_line(g_cwd);
+    write_line("Built-in: help cd exit");
+    write_line("Programs (/bin): echo clear pwd ls stat cat touch mkdir rmdir rm cp mv mount rescan which");
+    write_line("Programs (/bin): date poweroff reboot shutdown");
+    write_line("Usage notes: rm supports -r, -f, *, and path/*; mount takes <device> [path].");
 }
 
 static void cmd_cd(char* rest) {
@@ -641,317 +568,45 @@ static void cmd_cd(char* rest) {
         return;
     }
 
+    if (sys_chdir(path) != 0) {
+        write_line("shell: cd failed");
+        return;
+    }
+
     memcpy(g_cwd, path, strlen(path) + 1);
 }
 
-static void cmd_ls(char* rest) {
+/* Returns 0 when an external program was found and executed (or its own
+ * startup error was reported); returns -1 when the command was not found in
+ * PATH, so the caller can fall back to a shell built-in. */
+static int run_program(const char* cmd, char* rest) {
     char path[PATH_BUFFER_SIZE];
-    kiwi_stat_t st;
-    kiwi_dirent_t ent;
-    uint64_t index = 0;
-    int64_t rc = 0;
-    char* arg = next_arg(&rest);
-
-    if (!arg) {
-        memcpy(path, g_cwd, strlen(g_cwd) + 1);
-    } else if (resolve_path_arg(arg, path, sizeof(path)) != 0 || has_extra_args(rest)) {
-        write_line("usage: ls [path]");
-        return;
-    }
-
-    if (stat_path(path, &st) != 0) {
-        write_line("shell: ls failed");
-        return;
-    }
-    if (st.type == KIWI_VNODE_FILE) {
-        write_line(path);
-        return;
-    }
-    if (st.type != KIWI_VNODE_DIR) {
-        write_line("shell: ls failed");
-        return;
-    }
-
-    for (;;) {
-        memset(&ent, 0, sizeof(ent));
-        rc = sys_readdir(path, index, &ent);
-        if (rc < 0) {
-            write_line("shell: ls failed");
-            return;
-        }
-        if (rc == 0) {
-            return;
-        }
-        write_line(ent.name);
-        index++;
-    }
-}
-
-static void cmd_stat(char* rest) {
-    char path[PATH_BUFFER_SIZE];
-    kiwi_stat_t st;
-    char* arg = next_arg(&rest);
-
-    if (!arg || resolve_path_arg(arg, path, sizeof(path)) != 0 || has_extra_args(rest)) {
-        write_line("usage: stat <path>");
-        return;
-    }
-
-    memset(&st, 0, sizeof(st));
-    if (sys_stat(path, &st) != 0) {
-        write_line("shell: stat failed");
-        return;
-    }
-
-    write_stat_line(&st);
-}
-
-static void cmd_cat(char* rest) {
-    char path[PATH_BUFFER_SIZE];
-    char buf[IO_BUFFER_SIZE];
-    int64_t fd = -1;
-    int64_t n = 0;
-    int saw_output = 0;
-    char last_ch = '\0';
-    char* arg = next_arg(&rest);
-
-    if (!arg || resolve_path_arg(arg, path, sizeof(path)) != 0 || has_extra_args(rest)) {
-        write_line("usage: cat <path>");
-        return;
-    }
-
-    fd = sys_open(path, KIWI_O_RDONLY);
-    if (fd < 0) {
-        write_line("shell: cat failed");
-        return;
-    }
-
-    for (;;) {
-        n = sys_read((int)fd, buf, sizeof(buf));
-        if (n < 0) {
-            write_line("shell: cat read failed");
-            break;
-        }
-        if (n == 0) {
-            break;
-        }
-        saw_output = 1;
-        last_ch = buf[n - 1];
-        write_bytes(buf, (size_t)n);
-    }
-
-    (void)sys_close((int)fd);
-    if (!saw_output || last_ch != '\n') {
-        write_str("\n");
-    }
-}
-
-static void cmd_touch(char* rest) {
-    char path[PATH_BUFFER_SIZE];
-    kiwi_stat_t st;
-    int64_t fd = -1;
-    char* arg = next_arg(&rest);
-
-    if (!arg || resolve_path_arg(arg, path, sizeof(path)) != 0 || has_extra_args(rest)) {
-        write_line("usage: touch <path>");
-        return;
-    }
-
-    if (stat_path(path, &st) == 0) {
-        if (st.type != KIWI_VNODE_FILE) {
-            write_line("shell: touch: not a regular file");
-        }
-        return;
-    }
-
-    fd = sys_open(path, KIWI_O_WRONLY | KIWI_O_CREAT);
-    if (fd < 0) {
-        write_line("shell: touch failed");
-        return;
-    }
-
-    (void)sys_close((int)fd);
-}
-
-static void cmd_mkdir(char* rest) {
-    char path[PATH_BUFFER_SIZE];
-    char* arg = next_arg(&rest);
-
-    if (!arg || resolve_path_arg(arg, path, sizeof(path)) != 0 || has_extra_args(rest)) {
-        write_line("usage: mkdir <path>");
-        return;
-    }
-
-    if (sys_mkdir(path, 0755u) < 0) {
-        write_line("shell: mkdir failed");
-    }
-}
-
-static void cmd_rm(char* rest) {
-    char path[PATH_BUFFER_SIZE];
-    char* arg = next_arg(&rest);
-
-    if (!arg || resolve_path_arg(arg, path, sizeof(path)) != 0 || has_extra_args(rest)) {
-        write_line("usage: rm <path>");
-        return;
-    }
-
-    if (sys_unlink(path) < 0) {
-        write_line("shell: rm failed");
-    }
-}
-
-static void cmd_cp(char* rest) {
-    char src[PATH_BUFFER_SIZE];
-    char dst[PATH_BUFFER_SIZE];
-    char target[PATH_BUFFER_SIZE];
-    kiwi_stat_t st;
-    char* src_arg = next_arg(&rest);
-    char* dst_arg = next_arg(&rest);
-
-    if (!src_arg || !dst_arg ||
-        resolve_path_arg(src_arg, src, sizeof(src)) != 0 ||
-        resolve_path_arg(dst_arg, dst, sizeof(dst)) != 0 ||
-        has_extra_args(rest)) {
-        write_line("usage: cp <src> <dst>");
-        return;
-    }
-
-    memset(&st, 0, sizeof(st));
-    if (sys_stat(src, &st) != 0 || st.type != KIWI_VNODE_FILE) {
-        write_line("shell: cp only supports regular files");
-        return;
-    }
-
-    if (resolve_copy_target_path(src, dst, target, sizeof(target)) != 0) {
-        write_line("shell: cp failed");
-        return;
-    }
-
-    if (copy_file_contents(src, target) != 0) {
-        write_line("shell: cp failed");
-    }
-}
-
-static void cmd_mv(char* rest) {
-    char src[PATH_BUFFER_SIZE];
-    char dst[PATH_BUFFER_SIZE];
-    char target[PATH_BUFFER_SIZE];
-    kiwi_stat_t st;
-    char* src_arg = next_arg(&rest);
-    char* dst_arg = next_arg(&rest);
-
-    if (!src_arg || !dst_arg ||
-        resolve_path_arg(src_arg, src, sizeof(src)) != 0 ||
-        resolve_path_arg(dst_arg, dst, sizeof(dst)) != 0 ||
-        has_extra_args(rest)) {
-        write_line("usage: mv <src> <dst>");
-        return;
-    }
-
-    memset(&st, 0, sizeof(st));
-    if (sys_stat(src, &st) != 0 || st.type != KIWI_VNODE_FILE) {
-        write_line("shell: mv only supports regular files");
-        return;
-    }
-
-    if (resolve_copy_target_path(src, dst, target, sizeof(target)) != 0) {
-        write_line("shell: mv failed");
-        return;
-    }
-
-    if (copy_file_contents(src, target) != 0 || sys_unlink(src) != 0) {
-        write_line("shell: mv failed");
-    }
-}
-
-static void cmd_which(char* rest) {
-    char path[PATH_BUFFER_SIZE];
-    char* arg = next_arg(&rest);
-
-    if (!arg || has_extra_args(rest)) {
-        write_line("usage: which <command>");
-        return;
-    }
-
-    if (resolve_program_path(arg, path, sizeof(path)) != 0) {
-        write_line("shell: command not found");
-        return;
-    }
-
-    write_line(path);
-}
-
-static void cmd_mount(char* rest) {
-    char target[PATH_BUFFER_SIZE];
-    kiwi_stat_t st;
-    char* source_arg = next_arg(&rest);
-    char* target_arg = next_arg(&rest);
-
-    if (!source_arg || has_extra_args(rest)) {
-        write_line("usage: mount <device> [path]");
-        return;
-    }
-
-    if (!target_arg) {
-        target[0] = '/';
-        target[1] = '\0';
-    } else if (resolve_path_arg(target_arg, target, sizeof(target)) != 0) {
-        write_line("usage: mount <device> [path]");
-        return;
-    }
-
-    memset(&st, 0, sizeof(st));
-    if (sys_stat(target, &st) != 0 || st.type != KIWI_VNODE_DIR) {
-        write_line("shell: mount target must be an existing directory");
-        return;
-    }
-
-    if (sys_mount(source_arg, target) != 0) {
-        write_line("shell: mount failed");
-    }
-}
-
-static void cmd_rescan(char* rest) {
-    int64_t count = 0;
-
-    if (has_extra_args(rest)) {
-        write_line("usage: rescan");
-        return;
-    }
-
-    count = sys_dev_rescan();
-    if (count < 0) {
-        write_line("shell: rescan failed");
-        return;
-    }
-
-    write_str("rescan: found ");
-    write_u64((uint64_t)count);
-    write_line(" new disk(s)");
-}
-
-static void run_program(const char* cmd, char* rest) {
-    char path[PATH_BUFFER_SIZE];
+    const char* argv[PROGRAM_ARG_MAX];
+    char expanded[PROGRAM_ARG_MAX][PATH_BUFFER_SIZE];
+    int expanded_count = 0;
+    char* arg = NULL;
+    int argc = 0;
     int status = 0;
     int64_t pid = 0;
 
-    if (rest && *skip_spaces(rest)) {
-        write_line("shell: program arguments are not supported yet");
-        return;
-    }
-
     if (resolve_program_path(cmd, path, sizeof(path)) != 0) {
-        write_line("shell: command not found");
-        return;
+        return -1;
     }
 
-    pid = sys_spawn(path);
+    argv[argc++] = cmd;
+    while ((arg = next_arg(&rest)) != NULL) {
+        if (append_program_arg(argv, &argc, expanded, &expanded_count, arg) != 0) {
+            write_line("shell: too many program arguments");
+            return 0;
+        }
+    }
+
+    pid = sys_spawn_argv(path, argc, argv);
     if (pid < 0) {
         write_str("shell: failed to start ");
         write_str(path);
         write_str("\n");
-        return;
+        return 0;
     }
 
     if (sys_waitpid((int)pid, &status) < 0) {
@@ -959,15 +614,7 @@ static void run_program(const char* cmd, char* rest) {
         write_str(path);
         write_str("\n");
     }
-}
-
-static void cmd_clear(char* rest) {
-    if (has_extra_args(rest)) {
-        write_line("usage: clear");
-        return;
-    }
-
-    (void)sys_console_clear();
+    return 0;
 }
 
 int main(void) {
@@ -1047,56 +694,73 @@ int main(void) {
             continue;
         }
 
+        if (c == 1) {
+            cursor_pos = 0;
+            redraw_input_line(line, input_len, cursor_pos, 1);
+            continue;
+        }
+
+        if (c == 3) {
+            redraw_input_line(line, input_len, cursor_pos, 0);
+            write_str("^C\n");
+            input_len = 0;
+            cursor_pos = 0;
+            line[0] = '\0';
+            reset_history_navigation();
+            redraw_input_line(line, 0, 0, 1);
+            continue;
+        }
+
+        if (c == 4) {
+            if (input_len == 0) {
+                redraw_input_line(line, input_len, cursor_pos, 0);
+                write_str("\n");
+                return 0;
+            }
+            continue;
+        }
+
+        if (c == 5) {
+            cursor_pos = input_len;
+            redraw_input_line(line, input_len, cursor_pos, 1);
+            continue;
+        }
+
+        if (c == 21) {
+            input_len = 0;
+            cursor_pos = 0;
+            line[0] = '\0';
+            reset_history_navigation();
+            redraw_input_line(line, input_len, cursor_pos, 1);
+            continue;
+        }
+
         if (c == '\n') {
             char* raw = NULL;
+            char raw_for_history[INPUT_BUFFER_SIZE];
 
             redraw_input_line(line, input_len, input_len, 0);
             write_str("\n");
             line[input_len] = '\0';
             trim_trailing_spaces(line);
             raw = skip_spaces(line);
+            memcpy(raw_for_history, raw, strlen(raw) + 1);
 
             cursor = raw;
             cmd = next_arg(&cursor);
             if (cmd && *cmd != '\0') {
-                history_record(raw);
+                history_record(raw_for_history);
 
+                /* cd/exit/help are the only built-ins (they change shell state
+                 * or are shell-specific). Every other command runs from /bin. */
                 if (streq(cmd, "help")) {
                     show_help();
-                } else if (streq(cmd, "echo")) {
-                    write_line(skip_spaces(cursor));
-                } else if (streq(cmd, "clear")) {
-                    cmd_clear(cursor);
-                } else if (streq(cmd, "pwd")) {
-                    cmd_pwd(cursor);
                 } else if (streq(cmd, "cd")) {
                     cmd_cd(cursor);
-                } else if (streq(cmd, "ls")) {
-                    cmd_ls(cursor);
-                } else if (streq(cmd, "stat")) {
-                    cmd_stat(cursor);
-                } else if (streq(cmd, "cat")) {
-                    cmd_cat(cursor);
-                } else if (streq(cmd, "touch")) {
-                    cmd_touch(cursor);
-                } else if (streq(cmd, "mkdir")) {
-                    cmd_mkdir(cursor);
-                } else if (streq(cmd, "rm")) {
-                    cmd_rm(cursor);
-                } else if (streq(cmd, "cp")) {
-                    cmd_cp(cursor);
-                } else if (streq(cmd, "mv")) {
-                    cmd_mv(cursor);
-                } else if (streq(cmd, "mount")) {
-                    cmd_mount(cursor);
-                } else if (streq(cmd, "rescan")) {
-                    cmd_rescan(cursor);
-                } else if (streq(cmd, "which")) {
-                    cmd_which(cursor);
                 } else if (streq(cmd, "exit")) {
                     return 0;
-                } else {
-                    run_program(cmd, cursor);
+                } else if (run_program(cmd, cursor) != 0) {
+                    write_line("shell: command not found");
                 }
             }
 

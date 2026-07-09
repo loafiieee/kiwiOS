@@ -384,8 +384,14 @@ static void inode_zero(kifs_inode_t* ino) {
     ino->version = 1u;
 }
 
-static bool mkfs_partition(FILE* fp, uint64_t part_offset, uint32_t total_blocks, uint32_t inode_count) {
+static bool mkfs_partition(FILE* fp,
+                           uint64_t part_offset,
+                           uint32_t total_blocks,
+                           uint32_t inode_count,
+                           bool create_kiwios_root) {
     static const char* base_dir_names[] = { "bin", "dev", "mnt", "home", "tmp" };
+    const uint32_t base_dir_count = create_kiwios_root ? 5u : 0u;
+    const uint32_t data_blocks_needed = 1u + base_dir_count;
     uint32_t journal_blocks = 0;
     uint32_t usable_blocks = 0;
 
@@ -409,7 +415,7 @@ static bool mkfs_partition(FILE* fp, uint64_t part_offset, uint32_t total_blocks
         uint32_t it_blocks = (inode_count + 15u) / 16u;
         uint32_t data_start = 2u + bb_blocks + ib_blocks + it_blocks;
         uint32_t root_dir_blk = 0;
-        uint32_t dir_blks[5];
+        uint32_t dir_blks[5] = {0};
         uint8_t* bb_mem = NULL;
         uint8_t* ib_mem = NULL;
         uint8_t* it_mem = NULL;
@@ -418,7 +424,7 @@ static bool mkfs_partition(FILE* fp, uint64_t part_offset, uint32_t total_blocks
         kifs_superblock_t s0;
         kifs_superblock_t s1;
 
-        if (data_start + 6u > usable_blocks) {
+        if (data_start + data_blocks_needed > usable_blocks) {
             if (inode_count <= 16u) {
                 return false;
             }
@@ -454,14 +460,14 @@ static bool mkfs_partition(FILE* fp, uint64_t part_offset, uint32_t total_blocks
         sb.sb_seq = 1u;
 
         root_dir_blk = data_start;
-        for (uint32_t i = 0; i < 5u; i++) {
+        for (uint32_t i = 0; i < base_dir_count; i++) {
             dir_blks[i] = data_start + 1u + i;
         }
 
         bb_mem = (uint8_t*)calloc(bb_blocks, KIFS_BLOCK_SIZE);
         ib_mem = (uint8_t*)calloc(ib_blocks, KIFS_BLOCK_SIZE);
         it_mem = (uint8_t*)calloc(it_blocks, KIFS_BLOCK_SIZE);
-        data_mem = (uint8_t*)calloc(6u, KIFS_BLOCK_SIZE);
+        data_mem = (uint8_t*)calloc(data_blocks_needed, KIFS_BLOCK_SIZE);
         if (!bb_mem || !ib_mem || !it_mem || !data_mem) {
             free(bb_mem);
             free(ib_mem);
@@ -485,7 +491,7 @@ static bool mkfs_partition(FILE* fp, uint64_t part_offset, uint32_t total_blocks
             bitmap_set_in_blocks(bb_mem, bb_blocks, sb.inode_table_start + i);
         }
         bitmap_set_in_blocks(bb_mem, bb_blocks, root_dir_blk);
-        for (uint32_t i = 0; i < 5u; i++) {
+        for (uint32_t i = 0; i < base_dir_count; i++) {
             bitmap_set_in_blocks(bb_mem, bb_blocks, dir_blks[i]);
         }
         for (uint32_t i = 0; i < bb_blocks; i++) {
@@ -496,8 +502,10 @@ static bool mkfs_partition(FILE* fp, uint64_t part_offset, uint32_t total_blocks
             init_bitmap_block(ib_mem + (i * KIFS_BLOCK_SIZE), KIFS_MAGIC_IMB, KIFS_BTYPE_IMB);
         }
         bitmap_set_in_blocks(ib_mem, ib_blocks, 0u);
-        for (uint32_t ino = 1u; ino <= 7u; ino++) {
-            bitmap_set_in_blocks(ib_mem, ib_blocks, ino);
+        bitmap_set_in_blocks(ib_mem, ib_blocks, 1u);
+        bitmap_set_in_blocks(ib_mem, ib_blocks, 2u);
+        for (uint32_t i = 0; i < base_dir_count; i++) {
+            bitmap_set_in_blocks(ib_mem, ib_blocks, 3u + i);
         }
         for (uint32_t i = 0; i < ib_blocks; i++) {
             structured_rechecksum(ib_mem + (i * KIFS_BLOCK_SIZE));
@@ -520,7 +528,7 @@ static bool mkfs_partition(FILE* fp, uint64_t part_offset, uint32_t total_blocks
             inode_zero(&root);
             root.type = KIFS_INO_T_DIR;
             root.mode = 0755u;
-            root.link_count = 7u;
+            root.link_count = 2u + base_dir_count;
             root.size_bytes = KIFS_BLOCK_SIZE;
             root.inline_extent_count = 1u;
             root.inline_extents[0].disk_block_start = root_dir_blk;
@@ -530,7 +538,7 @@ static bool mkfs_partition(FILE* fp, uint64_t part_offset, uint32_t total_blocks
             orphan.type = KIFS_INO_T_FILE;
             orphan.link_count = 1u;
 
-            for (uint32_t i = 0; i < 5u; i++) {
+            for (uint32_t i = 0; i < base_dir_count; i++) {
                 inode_zero(&dirs[i]);
                 dirs[i].type = KIFS_INO_T_DIR;
                 dirs[i].mode = 0755u;
@@ -543,29 +551,49 @@ static bool mkfs_partition(FILE* fp, uint64_t part_offset, uint32_t total_blocks
 
             memcpy(it_mem + (KIFS_MKFS_ROOT_INO * 256u), &root, sizeof(root));
             memcpy(it_mem + (KIFS_MKFS_ORPHAN_INO * 256u), &orphan, sizeof(orphan));
-            for (uint32_t i = 0; i < 5u; i++) {
+            for (uint32_t i = 0; i < base_dir_count; i++) {
                 memcpy(it_mem + ((KIFS_MKFS_BIN_INO + i) * 256u), &dirs[i], sizeof(dirs[i]));
             }
 
             {
                 uint8_t* dirblk = data_mem;
                 uint32_t doff = 0u;
+                uint32_t dir_end = 0u;
 
                 init_dir_block(dirblk, KIFS_MKFS_ROOT_INO);
                 doff = ((kifs_shdr_t*)dirblk)->header_bytes;
+                dir_end = (uint32_t)((kifs_shdr_t*)dirblk)->header_bytes +
+                          (uint32_t)((kifs_shdr_t*)dirblk)->payload_bytes;
                 dir_write_ent(dirblk, doff, KIFS_MKFS_ROOT_INO, ".", 2u, dir_rec_len(1u));
                 doff += dir_rec_len(1u);
-                dir_write_ent(dirblk, doff, KIFS_MKFS_ROOT_INO, "..", 2u, dir_rec_len(2u));
-                doff += dir_rec_len(2u);
-                for (uint32_t i = 0; i < 5u; i++) {
-                    uint16_t rec = dir_rec_len((uint8_t)strlen(base_dir_names[i]));
+                {
+                    uint16_t min_rec = dir_rec_len(2u);
+                    uint16_t rec = min_rec;
+                    if (base_dir_count == 0u && dir_end > doff) {
+                        rec = (uint16_t)((dir_end - doff) & ~7u);
+                        if (rec < min_rec) {
+                            rec = min_rec;
+                        }
+                    }
+                    dir_write_ent(dirblk, doff, KIFS_MKFS_ROOT_INO, "..", 2u, rec);
+                    doff += rec;
+                }
+                for (uint32_t i = 0; i < base_dir_count; i++) {
+                    uint16_t min_rec = dir_rec_len((uint8_t)strlen(base_dir_names[i]));
+                    uint16_t rec = min_rec;
+                    if ((i + 1u) == base_dir_count && dir_end > doff) {
+                        rec = (uint16_t)((dir_end - doff) & ~7u);
+                        if (rec < min_rec) {
+                            rec = min_rec;
+                        }
+                    }
                     dir_write_ent(dirblk, doff, KIFS_MKFS_BIN_INO + i, base_dir_names[i], 2u, rec);
                     doff += rec;
                 }
                 structured_rechecksum(dirblk);
             }
 
-            for (uint32_t i = 0; i < 5u; i++) {
+            for (uint32_t i = 0; i < base_dir_count; i++) {
                 uint8_t* dirblk = data_mem + ((i + 1u) * KIFS_BLOCK_SIZE);
                 uint32_t doff = 0u;
                 uint16_t r1 = 0u;
@@ -640,7 +668,7 @@ static bool mkfs_partition(FILE* fp, uint64_t part_offset, uint32_t total_blocks
             free(data_mem);
             return false;
         }
-        for (uint32_t i = 0; i < 5u; i++) {
+        for (uint32_t i = 0; i < base_dir_count; i++) {
             if (!write_block(fp, part_offset, dir_blks[i], data_mem + ((i + 1u) * KIFS_BLOCK_SIZE))) {
                 free(bb_mem);
                 free(ib_mem);
@@ -665,11 +693,13 @@ static bool mkfs_partition(FILE* fp, uint64_t part_offset, uint32_t total_blocks
 static void usage(const char* argv0) {
     fprintf(stderr, "Usage:\n");
     fprintf(stderr, "  %s --check <disk.img> <partition_number>\n", argv0);
-    fprintf(stderr, "  %s <disk.img> <partition_number> [inode_count]\n", argv0);
+    fprintf(stderr, "  %s <disk.img> <partition_number> [inode_count] [--kiwios-root]\n", argv0);
 }
 
 int main(int argc, char** argv) {
     bool check_only = false;
+    bool create_kiwios_root = false;
+    bool inode_count_set = false;
     const char* disk_path = NULL;
     FILE* fp = NULL;
     uint32_t part_number = 0;
@@ -692,18 +722,29 @@ int main(int argc, char** argv) {
             return 1;
         }
     } else {
-        if (argc != 3 && argc != 4) {
+        int argi = 1;
+
+        if (argc < 3) {
             usage(argv[0]);
             return 1;
         }
-        disk_path = argv[1];
-        if (!parse_u32_strict(argv[2], &part_number) || part_number == 0u) {
+
+        disk_path = argv[argi++];
+        if (!parse_u32_strict(argv[argi++], &part_number) || part_number == 0u) {
             usage(argv[0]);
             return 1;
         }
-        if (argc == 4 && !parse_u32_strict(argv[3], &inode_count)) {
-            usage(argv[0]);
-            return 1;
+
+        while (argi < argc) {
+            if (strcmp(argv[argi], "--kiwios-root") == 0) {
+                create_kiwios_root = true;
+            } else if (!inode_count_set && parse_u32_strict(argv[argi], &inode_count)) {
+                inode_count_set = true;
+            } else {
+                usage(argv[0]);
+                return 1;
+            }
+            argi++;
         }
     }
 
@@ -733,7 +774,7 @@ int main(int argc, char** argv) {
         return ok ? 0 : 1;
     }
 
-    ok = mkfs_partition(fp, part_offset, part_blocks, inode_count);
+    ok = mkfs_partition(fp, part_offset, part_blocks, inode_count, create_kiwios_root);
     if (!ok) {
         fprintf(stderr, "mkfs_kifs: failed to format partition %" PRIu32 "\n", part_number);
         fclose(fp);
@@ -741,9 +782,10 @@ int main(int argc, char** argv) {
     }
 
     fclose(fp);
-    printf("mkfs_kifs: formatted %s partition %" PRIu32 " (%" PRIu32 " KiFS blocks)\n",
+    printf("mkfs_kifs: formatted %s partition %" PRIu32 " (%" PRIu32 " KiFS blocks, layout=%s)\n",
            disk_path,
            part_number,
-           part_blocks);
+           part_blocks,
+           create_kiwios_root ? "kiwios-root" : "minimal");
     return 0;
 }

@@ -32,12 +32,49 @@ typedef struct {
 
 static vfs_mount_slot_t g_mounts[VFS_MAX_MOUNTS];
 
+static bool mount_available(vfs_mount_t* mount) {
+    if (!mount || !mount->root) {
+        return false;
+    }
+    if (mount->dev && !block_device_is_present(mount->dev)) {
+        return false;
+    }
+    return true;
+}
+
+static bool root_candidate(block_device_t* dev, bool require_kifs) {
+    if (!dev || !block_device_is_present(dev) || block_device_is_removable(dev)) {
+        return false;
+    }
+    return !require_kifs || kifs_probe(dev);
+}
+
 static block_device_t* pick_default_root_device(void) {
     uint32_t pc = block_partition_count();
-    if (pc > 0) {
-        return block_partition_device(0);
+
+    for (uint32_t i = 0; i < pc; i++) {
+        block_device_t* dev = block_partition_device(i);
+        if (root_candidate(dev, true)) {
+            return dev;
+        }
     }
-    return block_boot_device();
+
+    if (root_candidate(block_boot_device(), true)) {
+        return block_boot_device();
+    }
+
+    for (uint32_t i = 0; i < pc; i++) {
+        block_device_t* dev = block_partition_device(i);
+        if (root_candidate(dev, false)) {
+            return dev;
+        }
+    }
+
+    if (root_candidate(block_boot_device(), false)) {
+        return block_boot_device();
+    }
+
+    return NULL;
 }
 
 void vfs_init(void) {
@@ -78,12 +115,7 @@ static int find_mount_slot_exact(const char* normalized_path) {
     return -1;
 }
 
-static int find_mount_slot_available(const char* normalized_path) {
-    int exact = find_mount_slot_exact(normalized_path);
-    if (exact >= 0) {
-        return exact;
-    }
-
+static int find_mount_slot_available(void) {
     for (uint32_t i = 0; i < VFS_MAX_MOUNTS; i++) {
         if (!g_mounts[i].used) {
             return (int)i;
@@ -95,12 +127,23 @@ static int find_mount_slot_available(const char* normalized_path) {
 
 static bool bind_mount_normalized(const char* normalized_path, vfs_mount_t* mount) {
     int slot = 0;
+    int existing = 0;
 
     if (!normalized_path || !mount || !mount->root) {
         return false;
     }
 
-    slot = find_mount_slot_available(normalized_path);
+    existing = find_mount_slot_exact(normalized_path);
+    if (existing >= 0) {
+        if (mount_available(g_mounts[existing].mount)) {
+            log_errorf("vfs", "Mount point already in use: %s", normalized_path);
+            return false;
+        }
+        g_mounts[existing].used = false;
+        g_mounts[existing].mount = NULL;
+    }
+
+    slot = find_mount_slot_available();
     if (slot < 0) {
         log_errorf("vfs", "No free mount slots for %s", normalized_path);
         return false;
@@ -144,6 +187,10 @@ vfs_mount_t* vfs_mount_at(const char* abs_path) {
         return NULL;
     }
 
+    if (!mount_available(g_mounts[slot].mount)) {
+        return NULL;
+    }
+
     return g_mounts[slot].mount;
 }
 
@@ -168,6 +215,10 @@ bool vfs_mount_dev(const char* abs_path, block_device_t* dev) {
     vnode_t* target = NULL;
 
     if (!dev) return false;
+    if (!block_device_is_present(dev)) {
+        log_errorf("vfs", "Mount source %s is not present", dev->name ? dev->name : "(noname)");
+        return false;
+    }
     if (!normalize_mount_path(abs_path, normalized, sizeof(normalized))) {
         return false;
     }
@@ -181,7 +232,18 @@ bool vfs_mount_dev(const char* abs_path, block_device_t* dev) {
         }
         vfs_vnode_put(target);
     }
-    if (find_mount_slot_available(normalized) < 0) {
+    {
+        int existing = find_mount_slot_exact(normalized);
+        if (existing >= 0 && mount_available(g_mounts[existing].mount)) {
+            log_errorf("vfs", "Mount point already in use: %s", normalized);
+            return false;
+        }
+        if (existing >= 0) {
+            g_mounts[existing].used = false;
+            g_mounts[existing].mount = NULL;
+        }
+    }
+    if (find_mount_slot_available() < 0) {
         log_errorf("vfs", "No free mount slots for %s", normalized);
         return false;
     }
@@ -203,6 +265,57 @@ bool vfs_mount_dev(const char* abs_path, block_device_t* dev) {
 
 bool vfs_mount_root_dev(block_device_t* dev) {
     return vfs_mount_dev("/", dev);
+}
+
+bool vfs_remount_root_dev(block_device_t* dev) {
+    int slot = -1;
+
+    if (!dev) {
+        return false;
+    }
+
+    for (uint32_t i = 0; i < (sizeof(g_drivers) / sizeof(g_drivers[0])); i++) {
+        const fs_driver_t* d = &g_drivers[i];
+        vfs_mount_t* m = NULL;
+
+        if (!d->probe || !d->mount) {
+            continue;
+        }
+
+        if (!d->probe(dev)) {
+            continue;
+        }
+
+        log_infof("vfs", "Probe matched: %s on %s", d->name, dev->name ? dev->name : "(noname)");
+        if (!d->mount(dev, &m) || !m || !m->root) {
+            log_errorf("vfs", "Root remount failed for driver %s", d->name);
+            continue;
+        }
+
+        memset(m->mount_path, 0, sizeof(m->mount_path));
+        memcpy(m->mount_path, "/", 2u);
+        m->root->mount = m;
+
+        slot = find_mount_slot_exact("/");
+        if (slot < 0) {
+            slot = find_mount_slot_available();
+            if (slot < 0) {
+                log_error("vfs", "No free mount slot for root remount");
+                return false;
+            }
+            g_mounts[slot].used = true;
+        }
+
+        g_mounts[slot].mount = m;
+        log_okf("vfs", "Remounted %s on %s at / (%s)",
+                m->fs_name ? m->fs_name : "(unknown)",
+                m->dev && m->dev->name ? m->dev->name : "(pseudo)",
+                m->readonly ? "ro" : "rw");
+        return true;
+    }
+
+    log_error("vfs", "No supported filesystem detected");
+    return false;
 }
 
 bool vfs_mount_root_auto(void) {
@@ -345,6 +458,9 @@ static vfs_mount_t* select_mount_for_path(const char* abs_path, const char** out
         if (!g_mounts[i].used || !g_mounts[i].mount) {
             continue;
         }
+        if (!mount_available(g_mounts[i].mount)) {
+            continue;
+        }
 
         if (!path_has_mount_prefix(abs_path, g_mounts[i].mount->mount_path, &mount_len)) {
             continue;
@@ -386,6 +502,7 @@ static vnode_t* clone_mount_root(vfs_mount_t* mount) {
     }
 
     *root = *mount->root;
+    root->refcount = 1;
     return root;
 }
 
@@ -469,6 +586,9 @@ bool vfs_readdir(const char* abs_path, vfs_readdir_cb cb, void* user) {
         bool duplicate_mount = false;
 
         if (!g_mounts[i].used || !g_mounts[i].mount) {
+            continue;
+        }
+        if (!mount_available(g_mounts[i].mount)) {
             continue;
         }
 
@@ -672,11 +792,24 @@ bool vfs_unlink(const char* abs_path) {
     return ok;
 }
 
+void vfs_vnode_get(vnode_t* vn) {
+    if (!vn) {
+        return;
+    }
+    if (vn->refcount == 0) {
+        vn->refcount = 1;
+    }
+    vn->refcount++;
+}
+
 void vfs_vnode_put(vnode_t* vn) {
     if (!vn) return;
+    if (vn->refcount > 1) {
+        vn->refcount--;
+        return;
+    }
     if (vn->ops && vn->ops->release) {
         vn->ops->release(vn);
     }
-    // In v0.1 we allocate vnodes with kmalloc and do not maintain refcounts.
     kfree(vn);
 }

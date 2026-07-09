@@ -1069,8 +1069,80 @@ shutdown/reboot, and better timer sources.
 basic scheduler/userspace pipeline works, and before APIC/SMP/power
 features become a hard blocker.
 
+Current status:
+- Done: Limine RSDP path, RSDT/XSDT table walking, checksum validation,
+  and fixed-table parsing for MADT, FADT, HPET, and MCFG
+- Done: read-only LAPIC probe from MADT and kernel-shell `acpi`/`apic`
+  inspection commands
+- Done: FADT reset-register reboot hook exposed through the kernel-shell
+  `reboot` command, with an 8042 reset fallback
+- Done: read-only HPET MMIO probe and kernel-shell `hpet` inspection
+  command
+- Done: core timekeeping API, `clock_gettime`, PIT tick accounting, CMOS
+  RTC seeding for `CLOCK_REALTIME`, FADT century-register support, libc
+  `time`/`gettimeofday`/`gmtime`/`mktime`/`strftime`, and `/bin/date`
+- Done: HPET main counter can be enabled as the high-resolution monotonic
+  read source when a 64-bit HPET is available; PIT remains the active
+  scheduler interrupt timer
+- Done: minimal ACPI S5 shutdown support by scanning DSDT for the fixed
+  `_S5_` package, programming PM1 control registers, and exposing both
+  kernel-shell `poweroff`/`shutdown` and userspace `/bin/poweroff`
+- Done: userspace `/bin/reboot` syscall path using FADT reset-register
+  reboot first, then the legacy 8042 reset fallback
+- Done: IOAPIC probe slot accounting fixed; QEMU now reports a real
+  IOAPIC version/redirection count instead of the previous zero-version
+  false negative
+- Still open: no ACPI SCI event handler yet. Real hardware power buttons,
+  sleep buttons, and lid-close events need SCI IRQ routing, PM1 fixed-event
+  enable/status handling, GPE dispatch, and likely EC/AML support for lid
+  devices before they can be handled correctly.
+- Still open: no AML interpreter, APIC IRQ switch, LAPIC/HPET
+  interrupt-timer replacement, or SMP startup yet; APIC routing still
+  needs QEMU, VMware, and real-hardware validation before replacing PIC
+
 ---
 
+## Platform Workstream — Intel HDA Audio
+
+**What:** Add an Intel High Definition Audio controller driver and a tiny
+kernel/user ABI for basic PCM playback.
+
+**Why:** Real hardware needs a common audio path. HDA is the practical
+first target for PCs and VMs, and it should be built as a platform driver
+rather than mixed into the console or userspace shell work.
+
+### HDA1. PCI discovery and MMIO setup
+
+- Detect class `0x04`, subclass `0x03` HDA controllers during PCI scan
+- Enable MMIO and bus mastering
+- Map HDA registers and reset the controller cleanly
+- Enumerate codecs through CORB/RIRB, with immediate commands allowed only
+  as early bring-up fallback
+
+### HDA2. Codec and output path bring-up
+
+- Parse codec widgets enough to find a DAC, mixer path, and output pin
+- Configure a simple stereo PCM output format first, such as 48 kHz
+  16-bit stereo
+- Start with one output stream and synchronous writes before adding
+  buffering complexity
+
+### HDA3. Audio device model
+
+- Expose audio through the device namespace later, for example
+  `/dev/audio0` or `/dev/hda0`
+- Add a small syscall or file-style write path for PCM samples only after
+  devfs/device-node semantics are ready for it
+- Keep mixer controls, input capture, volume, and multiple streams as
+  follow-up work
+
+### HDA4. Validation targets
+
+- QEMU/VMware HDA where available
+- One real laptop/desktop HDA controller
+- Failure mode should be clean logs and no boot blocker if audio init fails
+
+---
 ## Phase 14 — FAT Support (Read-Only First)
 
 **What:** Implement FAT mount, directory walking, and file reads through
@@ -1171,7 +1243,7 @@ Follow your spec's required ordering:
 Add write/create/mkdir/unlink to vnode_ops.
 Add sys_write for file FDs, sys_mkdir, sys_unlink syscalls.
 
-### 15e. Create the base KiFS directory tree
+### 15e. Create the base KiwiOS root directory tree
 
 Once KiFS can create directories, standardize new root images with:
 - `/bin`
@@ -1181,6 +1253,10 @@ Once KiFS can create directories, standardize new root images with:
 - `/tmp`
 
 Notes:
+- this is a KiwiOS root-filesystem policy, not a generic KiFS default
+- generic KiFS volumes such as USB test disks should start with only an
+  empty root directory unless the caller explicitly asks for the KiwiOS
+  root layout
 - `/dev` and `/mnt` are mountpoints, even though they initially exist as
   ordinary empty KiFS directories
 - `/home` is the only real home directory for now
@@ -1200,7 +1276,7 @@ After that, migrate boot/user programs from root-level paths to:
 
 **What:** Create a proper disk image build pipeline.
 
-### 16a. `tools/mkfs.kifs` (host-side, runs on Linux)
+### 16a. `tools/mkfs_kifs` (host-side, runs on Linux)
 
 A standalone C program that formats a partition in a disk image.
 Similar to your in-kernel mkfs but operates on a raw file.
@@ -1219,12 +1295,7 @@ Copies files into a KiFS partition in a disk image:
 ```bash
 # compile.sh additions:
 make userspace          # builds all .kxe files
-tools/mkfs.kifs disk.img --partition=1 --inodes=1024
-tools/kifs_mkdir disk.img 1 /bin
-tools/kifs_mkdir disk.img 1 /dev
-tools/kifs_mkdir disk.img 1 /mnt
-tools/kifs_mkdir disk.img 1 /home
-tools/kifs_mkdir disk.img 1 /tmp
+tools/mkfs_kifs disk.img 1 1024 --kiwios-root
 tools/kifs_cp disk.img 1 userspace/bin/init /bin/init
 tools/kifs_cp disk.img 1 userspace/bin/shell /bin/sh
 tools/kifs_cp disk.img 1 userspace/bin/hello /bin/hello
@@ -1315,9 +1386,23 @@ Current implementation note:
 - USB mass storage exists as an initial UHCI/full-speed Bulk-Only
   Transport driver; discovered devices become normal `/dev/diskN` and
   `/dev/diskNpM` block devices
+- PCI now explicitly identifies UHCI/OHCI/EHCI/xHCI controllers and the
+  kernel shell has a `usb` diagnostic command; xHCI MMIO probing logs
+  controller capabilities and connected ports, but xHCI command/event rings
+  and storage endpoints are not implemented yet
+- EHCI now releases non-high-speed ports to companion controllers; UHCI can
+  pick up full-speed devices, while OHCI companion support remains a TODO
+- if a FAT32 stick is behind unsupported OHCI or unfinished xHCI paths it will
+  be reported as detected-but-unsupported rather than silently disappearing
 - hotplug is currently detected by cheap USB polling from the scheduler
-  idle path and by `/dev`/mount lookups; full xHCI/EHCI support and safe
-  mounted-device removal are still future platform/storage work
+  idle path and by `/dev`/mount lookups; full xHCI/EHCI storage transport
+  support and safe mounted-device removal are still future platform/storage
+  work. Modern VMware USB passthrough and real hardware usually require
+  xHCI, so FAT/VFS cannot see those drives until xHCI mass storage exists.
+- QEMU USB hotplug currently logs one recoverable MSC/BOT command failure
+  (`CSW status=1`) during probe before capacity/read succeeds; tighten the
+  MSC reset/retry/probe path later, but this does not block VFS/removable
+  media work while device detection and mounts succeed
 
 ---
 
@@ -1367,6 +1452,16 @@ operations as KiFS:
 That lets userspace tools operate on either filesystem through the same
 API.
 
+Current implementation note:
+- FAT now has first-pass VFS write hooks for short 8.3 names:
+  create, write, truncate-to-zero, mkdir, unlink/rmdir of empty
+  directories, FAT chain allocation/freeing, and directory entry updates
+- mounts are writable only when the backing block device exposes a write
+  method; read-only devices still mount as read-only
+- long filename creation, rename, non-zero truncate, richer FAT timestamps,
+  fsck-style recovery, and heavier crash-safety work remain future Phase 18
+  hardening tasks
+
 ---
 
 ## Phase 19 — Cleanup + Polish
@@ -1375,8 +1470,18 @@ API.
 - Proper sys_exit with parent notification
 - Expand waitpid into full parent/child lifecycle and foreground job control
 - Signal-like mechanism for Ctrl+C (kill foreground process)
+- Ctrl+Z-style stop/suspend support once stopped processes, `fg`, and `bg`
+  semantics exist
 - Error numbers (ENOENT, ENOMEM, etc.) instead of -1
 - /dev/console or similar for stdin/stdout
+
+Current implementation note:
+- the userspace shell has first-pass prompt control keys: Ctrl+C cancels
+  the current input line, Ctrl+D exits on an empty prompt, Ctrl+U clears
+  the line, and Ctrl+A/Ctrl+E move to line start/end
+- this is not real signal/job-control support yet; Ctrl+C does not kill a
+  foreground child process until foreground process tracking and signal-like
+  delivery exist
 
 ---
 
@@ -1406,6 +1511,223 @@ items are:
 fancy. KXE should become better than generic formats for KiwiOS by being
 smaller, stricter, and more OS-aware, not by copying every historical
 feature from ELF or PE.
+
+Current implementation note:
+- `tools/kxeinfo` now validates and prints KXE headers/sections from the
+  host side, including version, ABI, CRC, entry point, virtual image range,
+  section ranges, flags, and overlap/refusal checks
+- this gives KXE a basic inspection/debugging workflow before adding more
+  complex format features such as build IDs, debug links, or relocations
+
+---
+
+## Phase 21 — Native Userland + POSIX Source Compatibility
+
+**What:** Grow KiwiOS from a bring-up shell plus test programs into a
+practical native userland, while shaping the userspace ABI toward POSIX
+source compatibility.
+
+**Why:** The goal is to run useful software without turning KiwiOS into
+Linux. POSIX-shaped APIs make programs, shells, and libraries portable
+from source. Kiwi-native pieces such as KXE, KiFS, and the kernel design
+can still remain first-class.
+
+### 21a. Build a real Kiwi command set
+
+Move shell built-ins and test utilities toward normal `/bin` programs:
+- `ls`, `cat`, `stat`, `echo`, `pwd`, `cd` shell support
+- `mkdir`, `rmdir`, `rm`, `cp`, `mv`, `touch`
+- `mount`, `umount`, `rescan`, `partlist`
+- `ps`, `kill`, `sleep`, `dmesg` or kernel-log viewing
+
+These can be separate binaries at first. A BusyBox-style multicall binary
+is optional later, not a requirement.
+
+### 21b. Make the ABI POSIX-shaped
+
+Add or refine:
+- `argc` / `argv` / `envp` process startup
+- `errno` values and stable syscall failure conventions
+- file descriptor inheritance, `dup`, `dup2`, and close-on-exec flags
+- `open`, `read`, `write`, `close`, `lseek`, `stat`, `getdents`
+- `chdir`, `getcwd`, `rename`, `rmdir`, `unlink`
+- `pipe`, redirection, and shell pipeline support
+- `waitpid`, process groups, foreground process tracking, and signals
+- a TTY/console layer with enough `termios`-like behavior for real shells
+
+Do this incrementally. Do not block filesystem, mount, or driver work on
+full POSIX completeness.
+
+### 21c. Add ELF as a compatibility executable format
+
+Keep KXE as the native Kiwi executable format. Add ELF through a
+binary-format dispatch layer:
+- KXE remains the preferred native format for Kiwi-specific programs
+- static ELF64 `ET_EXEC` support comes first
+- dynamic ELF, shared libraries, and a dynamic linker come much later
+- Linux syscall compatibility is explicitly not the first target
+
+The near-term compatibility goal is POSIX source portability, not running
+arbitrary unmodified Linux binaries.
+
+### 21d. Port real software carefully
+
+Start with small, portable programs and shells before larger targets:
+- first: simple core utilities and a small libc surface
+- then: a small POSIX-ish shell such as `dash`, `oksh`, or a stronger
+  native Kiwi shell
+- later: richer shells such as `fish`, after signals, job control,
+  `termios`, Unicode/string handling, and enough filesystem behavior exist
+
+### 21e. Text editor port prerequisites
+
+Use a real editor port as the compatibility forcing function. The target
+editor is `nano`, built from source against `kiwilib` and emitted as a
+native KXE binary. This is not about running the Linux binary unchanged
+yet; it is about making KiwiOS source-compatible enough that a normal
+portable terminal program can be brought over with small, reviewable
+patches.
+
+Before `nano` can be a realistic port, finish the pieces that interactive
+terminal programs assume:
+- `argc` / `argv` passing for `spawn` and `exec`, so `edit FILE.TXT` works
+  without hardcoded paths
+- stable `stdin`, `stdout`, and `stderr` file descriptors backed by a
+  console/TTY device instead of framebuffer-specific helper syscalls
+- canonical and raw-ish input modes: line-buffered shell input, direct key
+  delivery for editors, and clear handling for Ctrl-key combinations
+- ANSI/VT100-style output for cursor movement, clear screen, status lines,
+  inverse video, and basic screen repainting
+- terminal size reporting and resize behavior, even if fixed at first
+- `read`, `write`, `open`, `close`, `lseek`, `stat`, `unlink`, `rename`,
+  and truncate behavior close enough for editor save/write-temp workflows
+- writable temporary/swap-file policy, probably under `/tmp`
+- signal/job-control groundwork so Ctrl+C, Ctrl+Z, foreground process
+  ownership, and shell recovery behave predictably
+- enough libc compatibility headers/wrappers that small C programs can be
+  ported without rewriting every syscall callsite
+
+Do not make the temporary shell the long-term focus. A tiny native screen
+editor remains useful as a fast local test, but `nano` is the external
+port target that should drive missing libc, terminal, and filesystem
+features.
+
+### 21f. Nano Port Track
+
+Maintain the `ports/nano` workflow as the first substantial external
+source-port target:
+- keep the nano source version pinned and reproducible instead of pulling
+  an untracked latest tarball during normal builds
+- build nano as a static userspace ELF with the Kiwi headers, then convert
+  it to KXE with `elf2kxe`
+- start with a minimal nano configuration: no spell checker, no mouse,
+  no wide terminal database, no external helpers, and no dynamic loading
+- map missing configure checks to explicit Kiwi decisions instead of
+  blindly stubbing everything as success
+- use `libctest`, `termtest`, `cursestest`, and the native `edit` program
+  as regression tests before attempting the full nano build
+- keep local source patches small and documented so they reveal real OS
+  gaps rather than hiding them
+
+Current implementation note:
+- `kiwilib` now has first-pass POSIX-style compatibility headers and
+  wrappers for small ports: `errno.h`, `fcntl.h`, `unistd.h`,
+  `sys/types.h`, and `sys/stat.h`
+- backed wrappers include `open`, `read`, `write`, `close`, `lseek`,
+  `stat`, `fstat`, `mkdir`, `unlink`, `rmdir`, `rename`, `truncate`,
+  `ftruncate`, `access`, `chdir`, `getcwd`, `getpid`, `sbrk`, and `isatty`
+- KXE process startup now builds an initial userspace stack with `argc`
+  and `argv`; `exec_argv` and `spawn_argv` syscalls let shells pass
+  command arguments to child processes
+- the userspace shell now uses `spawn_argv`, and `/bin/argtest` exists as
+  a small verification program for command-line argument delivery
+- process cwd is now tracked in the kernel and inherited by spawned
+  children; the userspace shell synchronizes `cd` with `sys_chdir`
+- `/bin/cwdtest` exists as a small verification program for relative
+  paths, `getcwd`, `chdir`, `access`, `stat`, `fstat`, `rename`,
+  `truncate`, and `ftruncate`
+- the framebuffer console now has a first-pass ANSI/VT subset for
+  full-screen programs: SGR colors, cursor positioning/movement,
+  clear-screen, clear-line, save/restore cursor, carriage return, and tabs
+- `ioctl(TIOCGWINSZ)`, `tcgetattr`, `tcsetattr`, and `cfmakeraw` are now
+  available as minimal compatibility hooks; raw-mode stdin passes more
+  editor-style key escapes for Page Up/Down, Home/End, and Delete
+- `/bin/termtest` exists as a small verification program for terminal
+  size, termios calls, ANSI color, and cursor movement
+- `kiwilib` now has a small `sbrk`-backed heap allocator with `malloc`,
+  `calloc`, `realloc`, and `free`, plus early `stdlib` helpers such as
+  `exit`, `atoi`, `strtol`/`strtoul` variants, `abs` variants, and static
+  `getenv` values for `TERM`, `HOME`, `PATH`, `SHELL`, and `USER`
+- `/bin/alloctest` exists as a small verification program for the userspace
+  allocator
+- `kiwilib` now has first-pass formatted stdio and unbuffered file stream
+  support: `printf`, `fprintf`, `snprintf`, `fopen`, `fclose`, `fread`,
+  `fwrite`, `fgets`, `fseek`, `ftell`, `feof`, `ferror`, and related
+  helpers
+- `getopt`/`getopt_long` and `dirent` (`opendir`, `readdir`, `closedir`)
+  are available for small source ports
+- compatibility headers/stubs now exist for `limits.h`, `locale.h`,
+  `libintl.h`, `time.h`, `sys/time.h`, `signal.h`, `sys/select.h`, and
+  `poll.h`; signal/time/select/poll behavior is intentionally minimal
+  until real kernel support lands
+- `/bin/libctest` exists as a small verification program for formatted
+  stdio, stream file I/O, `strtol`, `getopt_long`, and `dirent`
+- `/bin/edit` exists as a tiny native screen editor milestone: raw input,
+  ANSI repaint, argv path open, Ctrl+S save, and Ctrl+Q quit. It is not a
+  nano replacement, but it exercises the same terminal/file path that a
+  larger editor port will need
+- `ports/nano/build.sh` builds pinned GNU nano source against `kiwilib`,
+  links a static Kiwi-target ELF, converts it to KXE, and stages it as
+  `userspace/bin/nano`; runtime validation in QEMU is still pending
+- missing nano runtime pieces should be added to `kiwilib`, the syscall
+  ABI, the TTY layer, or the VFS rather than baked into the temporary shell
+- this is source-porting scaffolding only; errno mapping is still coarse
+  because the kernel mostly returns `-1` instead of stable error numbers
+
+**Rule:** KiwiOS should be comfortable for Unix-like software without
+becoming a Linux clone. Prefer source compatibility first, binary
+compatibility only when the native ABI is stable enough to support it.
+
+---
+
+## Phase 22 — Console Scroll Performance (real hardware / VMware)
+
+**Symptom:** On real hardware and VMware, shell scrolling is extremely slow —
+printing any line that forces the screen to scroll takes several seconds,
+making the OS unbearable to use. Page Up / Page Down repaint quickly. Under
+QEMU the problem is hidden because its framebuffer is backed by plain RAM.
+
+**Likely root cause:** The framebuffer console scrolls by moving the whole
+screen inside the framebuffer (a VRAM→VRAM copy) on every newline. On real
+hardware the framebuffer is uncached / write-combining video memory: writes
+are slow and *reads are catastrophically slow*, so a full-screen move that
+reads back VRAM stalls for seconds per scroll. Page Up/Down are fast because
+they repaint from an in-RAM text/scrollback buffer instead of reading VRAM.
+
+**Direction:**
+- Never read from the framebuffer. Keep a RAM shadow/backbuffer (or repaint
+  the visible region from the existing text/cell scrollback) and only *write*
+  to VRAM.
+- Make the newline-scroll path use the same fast RAM-repaint route that Page
+  Up/Down already use, instead of a VRAM→VRAM move.
+- Minimize VRAM writes: redraw only cells that changed; consider batching.
+- Check how the framebuffer is mapped: if it is currently uncached, mapping it
+  write-combining (PAT/MTRR) would also speed up glyph writes. Reads must still
+  be avoided regardless.
+
+**How to verify:** On real hardware/VMware, sustained line output (e.g. `cat`
+of a long file, or `ls` of a big directory) scrolls smoothly with no
+multi-second stalls; QEMU stays fast.
+
+**Status (2026-07-06): implemented, pending real-hardware validation.** Root
+cause confirmed: `new_line()` scrolled via `scroll_view_up_one()`, a VRAM->VRAM
+`memmove` that read back the framebuffer once per line. The console already
+keeps every character in a RAM cell buffer (`g_buffer`) and Page Up/Down
+repaint from it via `render_visible()` (writes only). Fix: `new_line()` now
+calls `render_visible()` instead of the VRAM scroll, so no path reads video
+memory; `scroll_view_up_one()` was removed. Possible follow-up if bulk output
+is still heavy: batch the repaint to once per `write()` instead of per newline,
+or add a RAM backbuffer blit.
 
 ---
 
@@ -1437,6 +1759,7 @@ Phase 17: Device namespace + removable media    (3-5 hours, staged)
 Phase 18: FAT write support                     (4-6 hours)
 Phase 19: Cleanup + polish                      (ongoing)
 Phase 20: KXE improvements + tooling maturity   (incremental, later)
+Phase 21: Native userland + POSIX compatibility (incremental, later)
 ```
 
 The first real milestone is Phase 5. Everything before it is plumbing.
@@ -1453,13 +1776,39 @@ Completed or substantially completed:
 - Phase 17 — devfs, mount-table routing, multi-disk block registration,
   userspace/kernel mount workflows, and initial UHCI USB mass-storage
   hotplug
+- Phase 18 — first-pass FAT writes are already implemented (create, write,
+  truncate-to-zero, mkdir, unlink/rmdir of empty dirs, FAT chain alloc/free,
+  dirent updates for short 8.3 names); LFN writes, rename, and non-zero
+  truncate remain
+- Phase 21e/f — nano now builds AND runs interactively. Raw-mode Enter was
+  fixed to deliver CR (0x0D) so nano inserts newlines instead of running
+  Justify (^J). See the TTY CR/LF convention in src/core/syscall.c.
+
+In progress:
+- Phase 21a — shell built-ins ported to standalone /bin programs: echo, pwd,
+  ls, stat, cat, touch, mkdir, rmdir, rm, cp, mv, mount, rescan, which, clear.
+  cd/exit/help stay built-in permanently. All /bin programs are runtime-confirmed
+  working, so the shell built-in fallback and dead cmd_* code have been removed;
+  the shell now runs every non-builtin command from /bin only.
+- Phase 22 — console scroll performance fix implemented (no VRAM reads on
+  scroll); pending validation on real hardware / VMware.
 
 Still to do:
-- [ ] Phase 15 — finish KiFS write paths and create the standard KiFS directory tree
+- [ ] Phase 15 — finish KiFS write paths and create the standard KiwiOS root directory tree
 - [ ] Phase 16 — expand host-side tooling beyond file copy so the whole image lifecycle is handled from host tools
-- [ ] Phase 18 — add FAT write support on top of the generic VFS write API
-- [ ] Phase 19 — cleanup/polish, error codes, parent/child lifecycle, and console cleanup
+- [ ] Phase 18 — FAT write hardening: LFN writes, rename, non-zero truncate, crash-safety
+- [ ] Phase 19 — cleanup/polish, error codes, parent/child lifecycle, terminal control keys, and console cleanup
 - [ ] Phase 20 — KXE maturation and better tooling
+- [ ] Phase 21 — native command set, POSIX-shaped ABI, and later ELF compatibility
+- [ ] Phase 22 — validate the console scroll performance fix on real hardware / VMware (fix implemented; see the Phase 22 section)
+- [ ] Platform ACPI — finish MADT/APIC IRQ routing, ACPI shutdown hardening, SCI power/lid events, LAPIC/HPET interrupt-timer work, and SMP startup groundwork
+- [ ] Platform HDA audio — implement PCI/MMIO HDA, codec path setup, and first PCM playback device
+- [ ] USB companion controllers — add OHCI support and harden EHCI handoff for non-high-speed devices
+
+Current next phase:
+- Validate on real hardware / VMware: the /bin coreutils and the Phase 22
+  scroll fix. Both build clean and work in QEMU; scroll perf specifically must
+  be confirmed on real hardware, where the old VRAM-read scroll stalled.
 
 Filesystem/layout migration still pending:
 - [ ] decide whether later multi-user support should keep `/home` as the

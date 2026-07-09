@@ -2,8 +2,11 @@
 #include <stddef.h>
 #include <stdint.h>
 #include "arch/x86/gdt.h"
+#include "arch/x86/hpet.h"
 #include "arch/x86/idt.h"
 #include "arch/x86/io.h"
+#include "arch/x86/rtc.h"
+#include "arch/x86/apic.h"
 #include "arch/x86/syscall.h"
 #include "arch/x86/tss.h"
 #include "core/boot.h"
@@ -14,12 +17,14 @@
 #include "core/scheduler.h"
 #include "core/shell.h"
 #include "core/syscall.h"
+#include "core/time.h"
 #include "libc/string.h"
 #include "memory/heap.h"
 #include "memory/hhdm.h"
 #include "memory/pmm.h"
 #include "memory/vmm.h"
 #include "drivers/pci/pci.h"
+#include "drivers/acpi/acpi.h"
 #include "drivers/serial/serial.h"
 #include "drivers/block/block.h"
 #include "fs/bcache.h"
@@ -136,8 +141,29 @@ void kmain(void) {
     heap_init();
     log_ok("memory", "Virtual memory and heap initialized");
 
+    acpi_init(boot_rsdp_response());
+    apic_probe_from_acpi();
+    hpet_probe_from_acpi();
+
+    time_init(KIWI_TIMER_DEFAULT_HZ);
+    if (hpet_timekeeping_start()) {
+        time_set_highres_reader(hpet_monotonic_ns);
+        log_ok("time", "HPET selected as monotonic read source");
+    }
+    {
+        const acpi_fadt_info_t* fadt = acpi_fadt_info();
+        uint8_t century_register = (fadt && fadt->present) ? fadt->century_register : 0u;
+        uint64_t rtc_seconds = 0;
+
+        if (rtc_read_unix_time_with_century(century_register, &rtc_seconds)) {
+            time_set_realtime_unix(rtc_seconds);
+            log_okf("time", "RTC wall clock initialized (century_reg=%x)", century_register ? century_register : 0x32u);
+        } else {
+            log_info("time", "RTC wall clock unavailable; CLOCK_REALTIME starts at zero");
+        }
+    }
     init_pic();
-    init_pit(100);
+    init_pit(KIWI_TIMER_DEFAULT_HZ);
     log_info("interrupts", "PIC initialized and timer/keyboard unmasked");
 
     // Enable interrupts

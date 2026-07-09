@@ -216,9 +216,12 @@ bool kxe_validate(const uint8_t* header_page, uint64_t actual_file_size, kxe_ima
         return false;
     }
 
-    if (hdr.file_size != actual_file_size) {
-        log_error("kxe", "KXE header file size does not match vnode size");
+    if (actual_file_size < hdr.file_size) {
+        log_error("kxe", "KXE file is truncated");
         return false;
+    }
+    if (actual_file_size != hdr.file_size) {
+        log_info("kxe", "KXE file has trailing bytes; ignoring them");
     }
 
     crc_hdr = hdr;
@@ -239,7 +242,7 @@ bool kxe_validate(const uint8_t* header_page, uint64_t actual_file_size, kxe_ima
         uint64_t sec_page_start = 0;
 
         memcpy(&out_image->sections[i], header_page + entry_off, sizeof(kxe_section_t));
-        if (!section_validate(&hdr, &out_image->sections[i], actual_file_size)) {
+        if (!section_validate(&hdr, &out_image->sections[i], hdr.file_size)) {
             log_errorf("kxe", "Section %u failed validation", (unsigned)i);
             return false;
         }
@@ -332,7 +335,146 @@ static bool kxe_load_section(process_t* proc, vnode_t* file, const kxe_section_t
     return true;
 }
 
-process_t* kxe_load(const char* path) {
+static bool write_user_bytes(process_t* proc, uint64_t user_va, const void* src, uint64_t len) {
+    const uint8_t* in = (const uint8_t*)src;
+    uint64_t done = 0;
+
+    if (!proc || !proc->page_table || (!src && len != 0)) {
+        return false;
+    }
+
+    while (done < len) {
+        uint64_t va = user_va + done;
+        uint64_t page = PAGE_ALIGN_DOWN(va);
+        uint64_t off = va - page;
+        uint64_t phys = vmm_get_physical(proc->page_table, page);
+        uint64_t chunk = PAGE_SIZE - off;
+
+        if (!phys) {
+            return false;
+        }
+
+        if (chunk > len - done) {
+            chunk = len - done;
+        }
+
+        memcpy((uint8_t*)phys_to_virt(phys) + off, in + done, (size_t)chunk);
+        done += chunk;
+    }
+
+    return true;
+}
+
+static bool push_user_u64(process_t* proc, uint64_t* sp, uint64_t value) {
+    if (!proc || !sp || *sp < KXE_USER_MIN_VADDR + sizeof(value)) {
+        return false;
+    }
+
+    *sp -= sizeof(value);
+    return write_user_bytes(proc, *sp, &value, sizeof(value));
+}
+
+static bool kxe_setup_initial_stack(process_t* proc,
+                                    uint64_t argc,
+                                    const char* const argv[],
+                                    uint64_t* out_rsp) {
+    static const char* const default_env[] = {
+        "TERM=xterm",
+        "HOME=/home",
+        "PATH=/bin:/",
+        "SHELL=/bin/sh",
+        "USER=root",
+        NULL,
+    };
+    uint64_t stack_base = KXE_USER_STACK_TOP - ((uint64_t)KXE_USER_STACK_PAGES * PAGE_SIZE);
+    uint64_t sp = KXE_USER_STACK_TOP;
+    uint64_t arg_ptrs[KXE_MAX_ARGC];
+    uint64_t env_ptrs[KXE_MAX_ENVC];
+    uint64_t envc = 0;
+
+    if (!proc || !out_rsp || argc > KXE_MAX_ARGC || (argc != 0 && !argv)) {
+        return false;
+    }
+
+    memset(arg_ptrs, 0, sizeof(arg_ptrs));
+    memset(env_ptrs, 0, sizeof(env_ptrs));
+
+    while (envc < KXE_MAX_ENVC && default_env[envc]) {
+        envc++;
+    }
+
+    for (uint64_t i = envc; i > 0; i--) {
+        const char* env = default_env[i - 1u];
+        uint64_t len = strlen(env) + 1u;
+
+        if (len > KXE_ENV_MAX || sp < stack_base + len) {
+            return false;
+        }
+
+        sp -= len;
+        if (!write_user_bytes(proc, sp, env, len)) {
+            return false;
+        }
+
+        env_ptrs[i - 1u] = sp;
+    }
+
+    for (uint64_t i = argc; i > 0; i--) {
+        const char* arg = argv[i - 1u];
+        uint64_t len;
+
+        if (!arg) {
+            return false;
+        }
+
+        len = strlen(arg) + 1u;
+        if (len > KXE_ARG_MAX || sp < stack_base + len) {
+            return false;
+        }
+
+        sp -= len;
+        if (!write_user_bytes(proc, sp, arg, len)) {
+            return false;
+        }
+
+        arg_ptrs[i - 1u] = sp;
+    }
+
+    sp &= ~7ull;
+
+    if (!push_user_u64(proc, &sp, 0u)) {
+        return false;
+    }
+
+    for (uint64_t i = envc; i > 0; i--) {
+        if (!push_user_u64(proc, &sp, env_ptrs[i - 1u])) {
+            return false;
+        }
+    }
+
+    if (!push_user_u64(proc, &sp, 0u)) {
+        return false;
+    }
+
+    for (uint64_t i = argc; i > 0; i--) {
+        if (!push_user_u64(proc, &sp, arg_ptrs[i - 1u])) {
+            return false;
+        }
+    }
+
+    if (!push_user_u64(proc, &sp, argc)) {
+        return false;
+    }
+
+    if (sp < stack_base) {
+        return false;
+    }
+
+    *out_rsp = sp;
+    return true;
+}
+
+process_t* kxe_load_argv(const char* path, uint64_t argc, const char* const argv[]) {
     vnode_t* file = NULL;
     uint64_t stack_base = KXE_USER_STACK_TOP - ((uint64_t)KXE_USER_STACK_PAGES * PAGE_SIZE);
     uint8_t* header_page = NULL;
@@ -421,8 +563,16 @@ process_t* kxe_load(const char* path) {
         return NULL;
     }
 
+    if (!kxe_setup_initial_stack(proc, argc, argv, &proc->context.rsp)) {
+        log_error("kxe", "Failed to build initial argv stack for KXE image");
+        kfree(image);
+        kfree(header_page);
+        vfs_vnode_put(file);
+        process_destroy(proc);
+        return NULL;
+    }
+
     proc->context.rip = image->header.entry_vaddr;
-    proc->context.rsp = KXE_USER_STACK_TOP;
     proc->context.rflags = 0x202;
     proc->brk_base = PAGE_ALIGN_UP(image->header.image_max_vaddr);
     proc->brk_current = proc->brk_base;
@@ -432,4 +582,11 @@ process_t* kxe_load(const char* path) {
     kfree(header_page);
     vfs_vnode_put(file);
     return proc;
+}
+
+process_t* kxe_load(const char* path) {
+    const char* argv[1];
+
+    argv[0] = path_basename(path);
+    return kxe_load_argv(path, 1u, argv);
 }

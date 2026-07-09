@@ -1,0 +1,10 @@
+#ifndef KIWILIB_FEATURES_H
+#define KIWILIB_FEATURES_H
+
+#define __KIWILIB__ 1
+#define __unix__ 1
+#define _POSIX_VERSION 200809L
+#define _POSIX2_VERSION 200809L
+#define _XOPEN_VERSION 700
+
+#endif // KIWILIB_FEATURES_H

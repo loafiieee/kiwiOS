@@ -22,6 +22,12 @@ static volatile struct limine_hhdm_request hhdm_request = {
     .revision = 0
 };
 
+__attribute__((used, section(".limine_requests")))
+static volatile struct limine_rsdp_request rsdp_request = {
+    .id = LIMINE_RSDP_REQUEST,
+    .revision = 0
+};
+
 __attribute__((used, section(".limine_requests_start")))
 static volatile LIMINE_REQUESTS_START_MARKER;
 __attribute__((used, section(".limine_requests_end")))
@@ -51,6 +57,10 @@ struct limine_hhdm_response *boot_hhdm_response(void) {
 
 struct limine_module_response *boot_module_response(void) {
     return module_request.response;
+}
+
+struct limine_rsdp_response *boot_rsdp_response(void) {
+    return rsdp_request.response;
 }
 
 void boot_hcf(void) {

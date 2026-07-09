@@ -75,17 +75,25 @@ static void split_block(heap_block_t* block, size_t size) {
 
 // Merge adjacent free blocks
 static void merge_free_blocks(heap_block_t* block) {
+    if (!block) {
+        return;
+    }
+
     // Merge with next block if it's free
-    if (block->next && block->next->is_free) {
+    if (block->next &&
+        (uint8_t*)block + BLOCK_HEADER_SIZE + block->size == (uint8_t*)block->next &&
+        block->next->is_free) {
         block->size += BLOCK_HEADER_SIZE + block->next->size;
         block->next = block->next->next;
         if (block->next) {
             block->next->prev = block;
         }
     }
-    
+
     // Merge with previous block if it's free
-    if (block->prev && block->prev->is_free) {
+    if (block->prev &&
+        (uint8_t*)block->prev + BLOCK_HEADER_SIZE + block->prev->size == (uint8_t*)block &&
+        block->prev->is_free) {
         block->prev->size += BLOCK_HEADER_SIZE + block->size;
         block->prev->next = block->next;
         if (block->next) {

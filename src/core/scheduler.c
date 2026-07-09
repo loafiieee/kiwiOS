@@ -7,7 +7,7 @@
 #include "drivers/block/block.h"
 
 #define SCHED_DEFAULT_TIME_SLICE 5u
-#define SCHED_IDLE_HOTPLUG_POLL_TICKS 100u
+#define SCHED_IDLE_HOTPLUG_POLL_TICKS 10u
 
 extern void scheduler_restore_kernel_asm(const process_kernel_context_t* ctx)
     __attribute__((noreturn));
@@ -137,7 +137,7 @@ void scheduler_run(process_t* proc) {
 void scheduler_timer_tick(const interrupt_frame_t* frame) {
     process_t* current = process_current();
 
-    if (!frame || !current) {
+    if (!frame || (uint64_t)(uintptr_t)frame < 0x1000u || !current) {
         return;
     }
 

@@ -21,6 +21,11 @@ struct block_device {
     // Total size (in sectors) if known; 0 if unknown.
     uint64_t total_sectors;
 
+    // Hotplug state. Removable devices remain registered after unplug so
+    // stable names do not get reused while old references still exist.
+    bool present;
+    bool removable;
+
     // Driver-private pointer (for partitions/wrappers).
     void* ctx;
 
@@ -43,6 +48,8 @@ uint32_t block_poll_hotplug(void);
 
 // Returns the first registered boot block device, or NULL if none.
 block_device_t* block_boot_device(void);
+bool block_device_is_present(block_device_t* dev);
+bool block_device_is_removable(const block_device_t* dev);
 
 // Whole-disk enumeration.
 uint32_t block_disk_count(void);

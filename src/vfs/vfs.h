@@ -44,6 +44,7 @@ typedef struct vnode {
     vnode_type_t type;
     uint32_t ino;
     uint64_t size;
+    uint32_t refcount;
 
     const vnode_ops_t* ops;
     struct vfs_mount* mount;
@@ -70,6 +71,9 @@ bool vfs_mount_root_auto(void);
 // Mount a specific device as root, using probe order.
 bool vfs_mount_root_dev(block_device_t* dev);
 
+// Replace or install the root mount after an in-place format.
+bool vfs_remount_root_dev(block_device_t* dev);
+
 // Mount a specific device at an absolute path, using probe order.
 bool vfs_mount_dev(const char* abs_path, block_device_t* dev);
 
@@ -91,4 +95,5 @@ bool vfs_mkdir(const char* abs_path, uint32_t mode);
 bool vfs_unlink(const char* abs_path);
 
 // Drop a vnode allocated by VFS/driver.
+void vfs_vnode_get(vnode_t* vn);
 void vfs_vnode_put(vnode_t* vn);

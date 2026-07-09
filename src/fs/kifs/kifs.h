@@ -11,6 +11,7 @@ bool kifs_mount(block_device_t* dev, vfs_mount_t** out_mount);
 // Shell helper: format a device with KiFS v0.1.
 // WARNING: this destroys all data on the device.
 bool kifs_mkfs(block_device_t* dev, uint32_t inode_count);
+bool kifs_mkfs_ex(block_device_t* dev, uint32_t inode_count, bool create_kiwios_root);
 
 // Debug helper: read a window of bits from the on-disk block/inode bitmap.
 // out_bits[i] is 0 or 1 for the requested bit range.

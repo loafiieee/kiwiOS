@@ -17,6 +17,10 @@ void pmm_init(struct limine_memmap_response* memmap);
 // Returns physical address of the page, or 0 if no memory available
 void* pmm_alloc(void);
 
+// Allocate a single physical page below an exclusive physical address limit.
+// Useful for devices with 32-bit DMA address registers.
+void* pmm_alloc_below(uint64_t limit_exclusive);
+
 // Free a physical page
 // addr must be the address returned by pmm_alloc()
 void pmm_free(void* addr);

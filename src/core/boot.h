@@ -12,5 +12,6 @@ struct limine_framebuffer_response *boot_framebuffer_response(void);
 struct limine_memmap_response *boot_memmap_response(void);
 struct limine_hhdm_response *boot_hhdm_response(void);
 struct limine_module_response *boot_module_response(void);
+struct limine_rsdp_response *boot_rsdp_response(void);
 
 #endif // CORE_BOOT_H

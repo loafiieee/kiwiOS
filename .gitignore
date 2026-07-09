@@ -2,3 +2,7 @@
 /scheduler_*.bin
 /sys_read.bin
 /tmp_*.bin
+/usb-*.img
+/ports/nano/src/
+/ports/nano/build/
+/ports/nano/cache/

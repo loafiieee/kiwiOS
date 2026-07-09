@@ -141,6 +141,32 @@ void* pmm_alloc(void) {
     return NULL;
 }
 
+void* pmm_alloc_below(uint64_t limit_exclusive) {
+    size_t end = 0;
+    size_t start = 0;
+    void* result = NULL;
+
+    if (total_pages == 0 || limit_exclusive <= PAGE_SIZE) {
+        return NULL;
+    }
+
+    end = (size_t)(limit_exclusive / PAGE_SIZE);
+    if (end > total_pages) {
+        end = total_pages;
+    }
+    if (end == 0) {
+        return NULL;
+    }
+
+    start = (search_cursor < end) ? search_cursor : 0;
+    result = allocate_run_from(start, end, 1);
+    if (!result && start > 0) {
+        result = allocate_run_from(0, start, 1);
+    }
+
+    return result;
+}
+
 void pmm_free(void* addr) {
     if (addr == NULL) return;
     

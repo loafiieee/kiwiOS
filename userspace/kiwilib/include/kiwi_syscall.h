@@ -119,6 +119,111 @@ static inline int64_t sys_spawn(const char* path) {
     return (int64_t)ret;
 }
 
+static inline int64_t sys_exec_argv(const char* path, int argc, const char* const* argv) {
+    return kiwi_syscall3(KIWI_SYS_EXEC_ARGV,
+                         (uint64_t)(uintptr_t)path,
+                         (uint64_t)(uint32_t)argc,
+                         (uint64_t)(uintptr_t)argv);
+}
+
+static inline int64_t sys_spawn_argv(const char* path, int argc, const char* const* argv) {
+    return kiwi_syscall3(KIWI_SYS_SPAWN_ARGV,
+                         (uint64_t)(uintptr_t)path,
+                         (uint64_t)(uint32_t)argc,
+                         (uint64_t)(uintptr_t)argv);
+}
+
+static inline int64_t sys_ioctl(int fd, uint64_t request, void* arg) {
+    return kiwi_syscall3(KIWI_SYS_IOCTL,
+                         (uint64_t)(uint32_t)fd,
+                         request,
+                         (uint64_t)(uintptr_t)arg);
+}
+
+static inline int64_t sys_chdir(const char* path) {
+    return kiwi_syscall3(KIWI_SYS_CHDIR,
+                         (uint64_t)(uintptr_t)path,
+                         0,
+                         0);
+}
+
+static inline int64_t sys_getcwd(char* buf, uint64_t size) {
+    return kiwi_syscall2(KIWI_SYS_GETCWD,
+                         (uint64_t)(uintptr_t)buf,
+                         size);
+}
+
+static inline int64_t sys_rename(const char* old_path, const char* new_path) {
+    return kiwi_syscall2(KIWI_SYS_RENAME,
+                         (uint64_t)(uintptr_t)old_path,
+                         (uint64_t)(uintptr_t)new_path);
+}
+
+static inline int64_t sys_truncate(const char* path, uint64_t size) {
+    return kiwi_syscall2(KIWI_SYS_TRUNCATE,
+                         (uint64_t)(uintptr_t)path,
+                         size);
+}
+
+static inline int64_t sys_ftruncate(int fd, uint64_t size) {
+    return kiwi_syscall2(KIWI_SYS_FTRUNCATE,
+                         (uint64_t)(uint32_t)fd,
+                         size);
+}
+
+static inline int64_t sys_fstat(int fd, kiwi_stat_t* out) {
+    return kiwi_syscall2(KIWI_SYS_FSTAT,
+                         (uint64_t)(uint32_t)fd,
+                         (uint64_t)(uintptr_t)out);
+}
+
+static inline int64_t sys_access(const char* path, int mode) {
+    return kiwi_syscall2(KIWI_SYS_ACCESS,
+                         (uint64_t)(uintptr_t)path,
+                         (uint64_t)(uint32_t)mode);
+}
+
+static inline int64_t sys_dup(int oldfd) {
+    return kiwi_syscall3(KIWI_SYS_DUP,
+                         (uint64_t)(uint32_t)oldfd,
+                         0,
+                         0);
+}
+
+static inline int64_t sys_dup2(int oldfd, int newfd) {
+    return kiwi_syscall2(KIWI_SYS_DUP2,
+                         (uint64_t)(uint32_t)oldfd,
+                         (uint64_t)(uint32_t)newfd);
+}
+
+static inline int64_t sys_fcntl(int fd, int cmd, uint64_t arg) {
+    return kiwi_syscall3(KIWI_SYS_FCNTL,
+                         (uint64_t)(uint32_t)fd,
+                         (uint64_t)(uint32_t)cmd,
+                         arg);
+}
+
+static inline int64_t sys_pipe(int* fds) {
+    return kiwi_syscall3(KIWI_SYS_PIPE,
+                         (uint64_t)(uintptr_t)fds,
+                         0,
+                         0);
+}
+
+static inline int64_t sys_clock_gettime(int clock_id, kiwi_timespec_t* out) {
+    return kiwi_syscall2(KIWI_SYS_CLOCK_GETTIME,
+                         (uint64_t)(uint32_t)clock_id,
+                         (uint64_t)(uintptr_t)out);
+}
+
+static inline int64_t sys_poweroff(void) {
+    return kiwi_syscall3(KIWI_SYS_POWEROFF, 0, 0, 0);
+}
+
+static inline int64_t sys_reboot(void) {
+    return kiwi_syscall3(KIWI_SYS_REBOOT, 0, 0, 0);
+}
+
 static inline int64_t sys_waitpid(int pid, int* status) {
     return kiwi_syscall2(KIWI_SYS_WAITPID,
                          (uint64_t)(uint32_t)pid,

@@ -13,7 +13,7 @@
 #define RFLAGS_DF  (1ull << 10)
 
 #define KERNEL_CS_SELECTOR 0x08u
-#define SYSRET_BASE        0x10u
+#define SYSRET_BASE        0x13u
 
 extern void syscall_entry(void);
 
@@ -25,8 +25,11 @@ void syscall_init(void) {
     /*
      * STAR[47:32] gives the kernel CS selector loaded by SYSCALL.
      * STAR[63:48] is the SYSRET base. SYSRET derives:
-     *   user SS = base + 8  -> 0x18
-     *   user CS = base + 16 -> 0x20
+     *   user SS = base + 8  -> 0x1B
+     *   user CS = base + 16 -> 0x23
+     *
+     * The base includes RPL3. Using 0x10 would make SYSRET return with
+     * ring-0-looking user selectors, which later faults on interrupt IRETQ.
      */
     uint64_t star = 0;
     star |= ((uint64_t)KERNEL_CS_SELECTOR << 32);

@@ -107,15 +107,29 @@ static int translate_scancode(uint8_t scancode) {
 
     if (e0_prefix) {
         e0_prefix = false;
+        if (scancode == 0x1D) {
+            ctrl_pressed = true;
+            return -1;
+        }
+        if (scancode == 0x9D) {
+            ctrl_pressed = false;
+            return -1;
+        }
         if (scancode & 0x80) {
             return -1;
         }
 
         switch (scancode) {
+            case 0x47:
+                return KEY_HOME;
             case 0x49:
                 return KEY_PAGE_UP;
+            case 0x4F:
+                return KEY_END;
             case 0x51:
                 return KEY_PAGE_DOWN;
+            case 0x53:
+                return KEY_DELETE;
             case 0x48:
                 return KEY_ARROW_UP;
             case 0x50:
@@ -219,6 +233,10 @@ int keyboard_getchar(void) {
 
 int keyboard_getchar_nonblocking(void) {
     return keybuf_pop();
+}
+
+uint32_t keyboard_pending_count(void) {
+    return g_keybuf_count;
 }
 
 void wait_for_key(void) {

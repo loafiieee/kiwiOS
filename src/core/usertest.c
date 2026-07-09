@@ -54,7 +54,9 @@ void usertest_run(struct limine_framebuffer* fb) {
 
     proc->context.rip = USER_TEST_CODE_BASE;
     proc->context.rsp = USER_TEST_STACK_TOP;
-    proc->context.rflags = 0x202;
+    // Keep this legacy embedded ring-3 smoke test non-preemptible. Normal KXE
+    // programs exercise timer preemption; this path only needs syscall entry/exit.
+    proc->context.rflags = 0x2;
     proc->brk_base = PAGE_ALIGN_UP(USER_TEST_CODE_BASE + (uint64_t)program_size);
     proc->brk_current = proc->brk_base;
 

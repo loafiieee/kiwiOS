@@ -1,6 +1,9 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
+#include "arch/x86/apic.h"
+#include "arch/x86/hpet.h"
+#include "arch/x86/io.h"
 #include "core/boot.h"
 #include "core/console.h"
 #include "core/keyboard.h"
@@ -8,7 +11,9 @@
 #include "core/log.h"
 #include "core/scheduler.h"
 #include "core/usertest.h"
+#include "drivers/acpi/acpi.h"
 #include "drivers/block/block.h"
+#include "drivers/usb/usb_storage.h"
 #include "libc/string.h"
 #include "memory/heap.h"
 #include "memory/pmm.h"
@@ -96,7 +101,17 @@ static char g_shell_cwd[256] = "/";
 
 // ================= Command functions =================
 static void cmd_help(struct limine_framebuffer *fb) {
-    print(fb, "Commands: help clear echo about crash meminfo memtest vmtest heaptest fbinfo scale partlist rescan disktest mount kifs pwd cd ls stat cat touch mkdir rm cp mv exec usertest\n");
+    print(fb, "Built-ins:\n");
+    print(fb, "  help clear echo about crash meminfo memtest vmtest heaptest fbinfo scale\n");
+    print(fb, "  partlist rescan usb acpi apic hpet reboot poweroff disktest rawread rawwrite rawflush diskreadp diskwritep diskflushp\n");
+    print(fb, "  bcachestat bcacheflush bcacheflushp mount kifs kifsbmdump mkfs.kifs\n");
+    print(fb, "  pwd cd ls stat cat touch mkdir rm cp mv exec usertest\n");
+    print(fb, "Recovery:\n");
+    print(fb, "  mkfs.kifs /dev/disk0 --kiwios-root    format a whole disk as KiwiOS root\n");
+    print(fb, "  mkfs.kifs /dev/disk0p1 --kiwios-root  format a partition as KiwiOS root\n");
+    print(fb, "  mount /dev/disk0 /                    mount or remount root\n");
+    print(fb, "  exec /bin/sh                          start userspace shell if installed\n");
+    print(fb, "If /bin exists, unknown commands fall through to /bin/<command>.\n");
 }
 
 
@@ -803,6 +818,105 @@ static void cmd_rescan(struct limine_framebuffer* fb) {
     print(fb, " new disk(s)\n");
 }
 
+static void cmd_usb(struct limine_framebuffer* fb) {
+    uint32_t controller_count = usb_controller_count();
+    uint32_t storage_count = 0;
+
+    (void)block_poll_hotplug();
+    storage_count = usb_storage_disk_count();
+
+    print(fb, "USB controllers: ");
+    print_u32(fb, controller_count);
+    print(fb, "\n");
+
+    for (uint32_t i = 0; i < controller_count; i++) {
+        usb_controller_info_t info;
+        if (!usb_controller_info(i, &info)) {
+            continue;
+        }
+
+        print(fb, "  [");
+        print_u32(fb, i);
+        print(fb, "] ");
+        print(fb, usb_controller_type_name(info.type));
+        print(fb, " pci=");
+        print_hex(fb, info.bus);
+        print(fb, ":");
+        print_hex(fb, info.dev);
+        print(fb, ".");
+        print_u32(fb, info.func);
+        print(fb, info.mmio ? " mmio=" : " io=");
+        print_hex(fb, info.base);
+        print(fb, info.supported ? " supported\n" : " unsupported\n");
+    }
+
+    print(fb, "USB storage devices: ");
+    print_u32(fb, storage_count);
+    print(fb, "\n");
+    for (uint32_t i = 0; i < storage_count; i++) {
+        print(fb, "  [");
+        print_u32(fb, i);
+        print(fb, "] sectors=");
+        print_u64(fb, usb_storage_total_sectors(i));
+        print(fb, "\n");
+    }
+
+    if (controller_count == 0u) {
+        print(fb, "No PCI USB controller was detected.\n");
+    } else if (storage_count == 0u) {
+        print(fb, "No USB storage block device is available. If the controller is EHCI/xHCI, that driver is still missing.\n");
+    }
+}
+
+static void cmd_acpi(struct limine_framebuffer* fb) {
+    acpi_dump(fb);
+}
+
+static void cmd_apic(struct limine_framebuffer* fb) {
+    apic_dump(fb);
+}
+
+static void cmd_hpet(struct limine_framebuffer* fb) {
+    hpet_dump(fb);
+}
+
+static void legacy_i8042_reboot(void) {
+    asm volatile("cli");
+
+    for (uint32_t i = 0; i < 100000u; i++) {
+        if ((inb(0x64) & 0x02u) == 0u) {
+            break;
+        }
+        asm volatile("pause");
+    }
+
+    outb(0x64, 0xFE);
+    for (;;) {
+        asm volatile("hlt");
+    }
+}
+
+static void cmd_reboot(struct limine_framebuffer* fb) {
+    print(fb, "reboot: trying ACPI reset\n");
+    if (!acpi_reboot()) {
+        print(fb, "reboot: ACPI reset unavailable or failed\n");
+    } else {
+        print(fb, "reboot: ACPI reset returned; trying fallback\n");
+    }
+
+    legacy_i8042_reboot();
+}
+
+static void cmd_poweroff(struct limine_framebuffer* fb) {
+    print(fb, "poweroff: trying ACPI S5\n");
+    if (!acpi_poweroff()) {
+        print(fb, "poweroff: ACPI S5 unavailable or failed\n");
+        return;
+    }
+
+    print(fb, "poweroff: ACPI S5 returned; hardware did not power off\n");
+}
+
 static void cmd_diskreadp(struct limine_framebuffer* fb, const char* args) {
     uint32_t idx = 0;
     uint64_t lba = 0;
@@ -974,19 +1088,44 @@ static const char* trim_spaces(const char* s) {
 static bool copy_next_token(const char** s, char* out, uint32_t out_cap) {
     const char* cur = NULL;
     uint32_t len = 0;
+    char quote = '\0';
 
     if (!s || !out || out_cap == 0) return false;
     cur = trim_spaces(*s);
     if (!cur || *cur == '\0') return false;
 
-    while (cur[len] && cur[len] != ' ') {
-        len++;
+    while (*cur) {
+        if (quote) {
+            if (*cur == quote) {
+                quote = '\0';
+                cur++;
+                continue;
+            }
+            if (quote == '"' && *cur == '\\' && cur[1] != '\0') {
+                cur++;
+            }
+        } else {
+            if (*cur == ' ') {
+                break;
+            }
+            if (*cur == '"' || *cur == '\'') {
+                quote = *cur++;
+                continue;
+            }
+            if (*cur == '\\' && cur[1] != '\0') {
+                cur++;
+            }
+        }
+
+        if (len + 1u >= out_cap) return false;
+        out[len++] = *cur++;
     }
 
-    if (len + 1u > out_cap) return false;
-    memcpy(out, cur, len);
     out[len] = '\0';
-    *s = skip_token(cur);
+    if (*cur != '\0') {
+        cur++;
+    }
+    *s = trim_spaces(cur);
     return true;
 }
 
@@ -1158,6 +1297,43 @@ static const char* shell_path_basename(const char* path) {
     return last;
 }
 
+static bool build_kxe_argv(const char* argv0,
+                           const char* args,
+                           char storage[KXE_MAX_ARGC][KXE_ARG_MAX],
+                           const char* argv[KXE_MAX_ARGC],
+                           uint64_t* out_argc) {
+    const char* cur = trim_spaces(args);
+    uint64_t argc = 0;
+    uint32_t len = 0;
+
+    if (!argv0 || !*argv0 || !storage || !argv || !out_argc) {
+        return false;
+    }
+
+    len = (uint32_t)strlen(argv0);
+    if (len + 1u > KXE_ARG_MAX) {
+        return false;
+    }
+    memcpy(storage[argc], argv0, len + 1u);
+    argv[argc] = storage[argc];
+    argc++;
+
+    while (cur && *cur) {
+        if (argc >= KXE_MAX_ARGC) {
+            return false;
+        }
+        if (!copy_next_token(&cur, storage[argc], KXE_ARG_MAX)) {
+            return false;
+        }
+        argv[argc] = storage[argc];
+        argc++;
+        cur = trim_spaces(cur);
+    }
+
+    *out_argc = argc;
+    return true;
+}
+
 static bool resolve_copy_target_path(const char* src_path,
                                      const char* dst_path,
                                      char* out,
@@ -1249,9 +1425,11 @@ static bool copy_file_vfs(struct limine_framebuffer* fb,
                           bool unlink_source) {
     vnode_t* src = NULL;
     vnode_t* dst = NULL;
+    vnode_t* check = NULL;
     uint8_t* tmp = NULL;
     uint64_t src_off = 0;
     uint64_t dst_off = 0;
+    uint64_t expected_size = 0;
 
     if (!src_path || !dst_path || strcmp(src_path, dst_path) == 0) {
         print(fb, unlink_source ? "mv: invalid paths\n" : "cp: invalid paths\n");
@@ -1268,6 +1446,7 @@ static bool copy_file_vfs(struct limine_framebuffer* fb,
         vfs_vnode_put(src);
         return false;
     }
+    expected_size = src->size;
 
     if (!ensure_writable_vnode(dst_path, &dst) || !dst) {
         print(fb, unlink_source ? "mv: destination open failed\n" : "cp: destination open failed\n");
@@ -1308,11 +1487,210 @@ static bool copy_file_vfs(struct limine_framebuffer* fb,
     vfs_vnode_put(src);
     vfs_vnode_put(dst);
 
+    if (!vfs_resolve(dst_path, &check) || !check || check->size != expected_size) {
+        if (check) {
+            vfs_vnode_put(check);
+        }
+        print(fb, unlink_source ? "mv: verify failed; destination size mismatch\n"
+                                : "cp: verify failed; destination size mismatch\n");
+        (void)vfs_unlink(dst_path);
+        return false;
+    }
+    vfs_vnode_put(check);
+
     if (unlink_source && !vfs_unlink(src_path)) {
         print(fb, "mv: unlink failed\n");
         return false;
     }
 
+    return true;
+}
+
+static bool path_is_directory(const char* path) {
+    vnode_t* vn = NULL;
+    bool is_dir = false;
+
+    if (vfs_resolve(path, &vn) && vn) {
+        is_dir = (vn->type == VNODE_DIR);
+        vfs_vnode_put(vn);
+    }
+
+    return is_dir;
+}
+
+static bool shell_pattern_has_wildcards(const char* s) {
+    if (!s) {
+        return false;
+    }
+
+    while (*s) {
+        if (*s == '*' || *s == '?') {
+            return true;
+        }
+        s++;
+    }
+
+    return false;
+}
+
+static bool shell_pattern_match(const char* pattern, const char* text) {
+    if (!pattern || !text) {
+        return false;
+    }
+
+    while (*pattern) {
+        if (*pattern == '*') {
+            while (*pattern == '*') {
+                pattern++;
+            }
+            if (*pattern == '\0') {
+                return true;
+            }
+            while (*text) {
+                if (shell_pattern_match(pattern, text)) {
+                    return true;
+                }
+                text++;
+            }
+            return false;
+        }
+
+        if (*pattern == '?') {
+            if (*text == '\0') {
+                return false;
+            }
+            pattern++;
+            text++;
+            continue;
+        }
+
+        if (*pattern != *text) {
+            return false;
+        }
+        pattern++;
+        text++;
+    }
+
+    return *text == '\0';
+}
+
+static bool split_copy_glob(const char* raw,
+                            char* dir_raw,
+                            uint32_t dir_cap,
+                            char* pattern,
+                            uint32_t pattern_cap) {
+    const char* last_slash = NULL;
+    uint32_t dir_len = 0;
+    uint32_t pat_len = 0;
+
+    if (!raw || !dir_raw || !pattern || dir_cap < 2u || pattern_cap < 2u) {
+        return false;
+    }
+
+    for (const char* p = raw; *p; p++) {
+        if (*p == '/') {
+            last_slash = p;
+        }
+    }
+
+    if (!last_slash) {
+        dir_raw[0] = '.';
+        dir_raw[1] = '\0';
+        pat_len = (uint32_t)strlen(raw);
+        if (pat_len + 1u > pattern_cap) {
+            return false;
+        }
+        memcpy(pattern, raw, pat_len + 1u);
+        return true;
+    }
+
+    dir_len = (uint32_t)(last_slash - raw);
+    if (dir_len == 0) {
+        dir_len = 1;
+    }
+    if (dir_len + 1u > dir_cap) {
+        return false;
+    }
+
+    memcpy(dir_raw, raw, dir_len);
+    dir_raw[dir_len] = '\0';
+
+    pat_len = (uint32_t)strlen(last_slash + 1);
+    if (pat_len == 0 || pat_len + 1u > pattern_cap) {
+        return false;
+    }
+
+    memcpy(pattern, last_slash + 1, pat_len + 1u);
+    return true;
+}
+
+typedef struct {
+    struct limine_framebuffer* fb;
+    const char* src_dir;
+    const char* pattern;
+    const char* dst_dir;
+    uint32_t copied;
+    bool failed;
+} copy_glob_ctx_t;
+
+static bool copy_glob_readdir_cb(const char* name, uint32_t ino, void* user) {
+    copy_glob_ctx_t* ctx = (copy_glob_ctx_t*)user;
+    char src[256];
+    char target[256];
+    uint32_t dir_len = 0;
+    uint32_t name_len = 0;
+
+    (void)ino;
+
+    if (!ctx || !name || strcmp(name, ".") == 0 || strcmp(name, "..") == 0) {
+        return true;
+    }
+
+    if (!shell_pattern_match(ctx->pattern, name)) {
+        return true;
+    }
+
+    dir_len = (uint32_t)strlen(ctx->src_dir);
+    name_len = (uint32_t)strlen(name);
+
+    if (strcmp(ctx->src_dir, "/") == 0) {
+        if (1u + name_len + 1u > sizeof(src)) {
+            ctx->failed = true;
+            return false;
+        }
+        src[0] = '/';
+        memcpy(src + 1u, name, name_len + 1u);
+    } else {
+        if (dir_len + 1u + name_len + 1u > sizeof(src)) {
+            ctx->failed = true;
+            return false;
+        }
+        memcpy(src, ctx->src_dir, dir_len);
+        src[dir_len] = '/';
+        memcpy(src + dir_len + 1u, name, name_len + 1u);
+    }
+
+    if (!resolve_copy_target_path(src, ctx->dst_dir, target, sizeof(target))) {
+        print(ctx->fb, "cp: invalid destination\n");
+        ctx->failed = true;
+        return false;
+    }
+
+    vnode_t* matched = NULL;
+    if (vfs_resolve(src, &matched) && matched) {
+        bool is_file = (matched->type == VNODE_FILE);
+        vfs_vnode_put(matched);
+        if (!is_file) {
+            return true;
+        }
+    }
+
+    if (!copy_file_vfs(ctx->fb, src, target, false)) {
+        ctx->failed = true;
+        return false;
+    }
+
+    ctx->copied++;
     return true;
 }
 
@@ -1348,7 +1726,7 @@ static void cmd_mount(struct limine_framebuffer* fb, const char* args) {
 
         cur = trim_spaces(cur);
         if (*cur == '\0') {
-            ok = vfs_mount_root_dev(dev);
+            ok = vfs_root_mount() ? vfs_remount_root_dev(dev) : vfs_mount_root_dev(dev);
         } else {
             if (!copy_next_token(&cur, path_buf, sizeof(path_buf)) ||
                 !normalize_shell_path(path_buf, target_path, sizeof(target_path)) ||
@@ -1358,7 +1736,11 @@ static void cmd_mount(struct limine_framebuffer* fb, const char* args) {
             }
 
             mounted_path = target_path;
-            ok = vfs_mount_dev(target_path, dev);
+            if (strcmp(target_path, "/") == 0) {
+                ok = vfs_root_mount() ? vfs_remount_root_dev(dev) : vfs_mount_root_dev(dev);
+            } else {
+                ok = vfs_mount_dev(target_path, dev);
+            }
         }
     } else {
         ok = vfs_mount_root_auto();
@@ -1386,15 +1768,26 @@ static void cmd_mount(struct limine_framebuffer* fb, const char* args) {
 
 static void cmd_mkfs_kifs(struct limine_framebuffer* fb, const char* args) {
     char dev_buf[64];
+    char opt_buf[64];
+    bool create_kiwios_root = false;
+    bool mounted_root = false;
+    uint32_t inodes = 1024;
+
     args = trim_spaces(args);
     if (!copy_next_token(&args, dev_buf, sizeof(dev_buf))) {
-        print(fb, "Usage: mkfs.kifs <device> [inodes]\n");
+        print(fb, "Usage: mkfs.kifs <device> [inodes] [--kiwios-root|--minimal]\n");
         return;
     }
 
-    uint32_t inodes = 1024;
-    if (args && *args) {
-        parse_u32(args, &inodes);
+    while (copy_next_token(&args, opt_buf, sizeof(opt_buf))) {
+        if (strcmp(opt_buf, "--kiwios-root") == 0) {
+            create_kiwios_root = true;
+        } else if (strcmp(opt_buf, "--minimal") == 0) {
+            create_kiwios_root = false;
+        } else if (!parse_u32(opt_buf, &inodes)) {
+            print(fb, "Usage: mkfs.kifs <device> [inodes] [--kiwios-root|--minimal]\n");
+            return;
+        }
     }
 
     block_device_t* dev = resolve_block_device_spec(dev_buf, true);
@@ -1403,12 +1796,29 @@ static void cmd_mkfs_kifs(struct limine_framebuffer* fb, const char* args) {
         return;
     }
 
+    vfs_mount_t* root = vfs_root_mount();
+    mounted_root = root && root->dev == dev;
+    if (mounted_root) {
+        print(fb, "mkfs.kifs: warning: formatting current root; root will be remounted\n");
+    }
+
     print(fb, "mkfs.kifs: formatting (THIS DESTROYS ALL DATA)...\n");
-    if (!kifs_mkfs(dev, inodes)) {
+    if (!kifs_mkfs_ex(dev, inodes, create_kiwios_root)) {
         print(fb, "mkfs.kifs: FAILED (see logs)\n");
         return;
     }
     print(fb, "mkfs.kifs: OK\n");
+    if (create_kiwios_root) {
+        print(fb, "mkfs.kifs: created /bin /dev /mnt /home /tmp; install /bin/init before userspace boot\n");
+    }
+
+    if (mounted_root || !vfs_root_mount()) {
+        if (vfs_remount_root_dev(dev)) {
+            print(fb, "mkfs.kifs: root mounted at /\n");
+        } else {
+            print(fb, "mkfs.kifs: formatted, but root remount failed\n");
+        }
+    }
 }
 
 static void cmd_kifsbmdump(struct limine_framebuffer* fb, const char* args) {
@@ -1513,7 +1923,7 @@ static void cmd_kifs(struct limine_framebuffer* fb, const char* args) {
         print(fb, "Usage: kifs <subcmd> ...\n");
         print(fb, "  kifs sb\n");
         print(fb, "  kifs bmdump [nbits]\n");
-        print(fb, "  kifs mkfs <device> [inodes]\n");
+        print(fb, "  kifs mkfs <device> [inodes] [--kiwios-root|--minimal]\n");
         print(fb, "  kifs mount [device [path]]\n");
         return;
     }
@@ -1790,16 +2200,57 @@ static void cmd_cp_vfs(struct limine_framebuffer* fb, const char* args) {
     const char* cur = trim_spaces(args);
     char src_raw[256];
     char dst_raw[256];
+    char dir_raw[256];
+    char pattern[128];
+    char src_dir[256];
     char src[256];
     char dst[256];
     char target[256];
 
     if (!copy_next_token(&cur, src_raw, sizeof(src_raw)) ||
         !copy_next_token(&cur, dst_raw, sizeof(dst_raw)) ||
-        !normalize_shell_path(src_raw, src, sizeof(src)) ||
         !normalize_shell_path(dst_raw, dst, sizeof(dst)) ||
         *trim_spaces(cur) != '\0') {
         print(fb, "Usage: cp <src> <dst>\n");
+        return;
+    }
+
+    if (shell_pattern_has_wildcards(src_raw)) {
+        copy_glob_ctx_t ctx;
+
+        if (!split_copy_glob(src_raw, dir_raw, sizeof(dir_raw), pattern, sizeof(pattern)) ||
+            !normalize_shell_path(dir_raw, src_dir, sizeof(src_dir))) {
+            print(fb, "cp: invalid source pattern\n");
+            return;
+        }
+
+        if (!path_is_directory(dst)) {
+            print(fb, "cp: wildcard destination must be a directory\n");
+            return;
+        }
+
+        ctx.fb = fb;
+        ctx.src_dir = src_dir;
+        ctx.pattern = pattern;
+        ctx.dst_dir = dst;
+        ctx.copied = 0;
+        ctx.failed = false;
+
+        if (!vfs_readdir(src_dir, copy_glob_readdir_cb, &ctx)) {
+            if (!ctx.failed) {
+                print(fb, "cp: source directory not found\n");
+            }
+            return;
+        }
+
+        if (!ctx.failed && ctx.copied == 0) {
+            print(fb, "cp: source not found\n");
+        }
+        return;
+    }
+
+    if (!normalize_shell_path(src_raw, src, sizeof(src))) {
+        print(fb, "cp: invalid source\n");
         return;
     }
 
@@ -1836,26 +2287,53 @@ static void cmd_mv_vfs(struct limine_framebuffer* fb, const char* args) {
     (void)copy_file_vfs(fb, src, target, true);
 }
 
-static void cmd_exec(struct limine_framebuffer* fb, const char* args) {
-    const char* cur = trim_spaces(args);
-    char raw[256];
+static bool run_kxe_command(struct limine_framebuffer* fb,
+                            const char* raw,
+                            const char* args,
+                            bool quiet_not_found) {
     char path[256];
+    char argv_storage[KXE_MAX_ARGC][KXE_ARG_MAX];
+    const char* argv[KXE_MAX_ARGC];
+    uint64_t argc = 0;
+    process_t* proc = NULL;
 
-    if (!copy_next_token(&cur, raw, sizeof(raw)) ||
-        !resolve_program_path(raw, path, sizeof(path)) ||
-        *trim_spaces(cur) != '\0') {
-        print(fb, "Usage: exec <path>\n");
-        return;
+    if (!raw || !*raw) {
+        return false;
     }
 
-    process_t* proc = kxe_load(path);
+    if (!resolve_program_path(raw, path, sizeof(path))) {
+        if (!quiet_not_found) {
+            print(fb, "exec: program not found\n");
+        }
+        return false;
+    }
+
+    if (!build_kxe_argv(raw, args, argv_storage, argv, &argc)) {
+        print(fb, "exec: too many arguments or argument too long\n");
+        return true;
+    }
+
+    proc = kxe_load_argv(path, argc, argv);
     if (!proc) {
         print(fb, "exec: load failed\n");
-        return;
+        return true;
     }
 
     print(fb, "exec: scheduling process...\n");
     scheduler_run(proc);
+    return true;
+}
+
+static void cmd_exec(struct limine_framebuffer* fb, const char* args) {
+    const char* cur = trim_spaces(args);
+    char raw[256];
+
+    if (!copy_next_token(&cur, raw, sizeof(raw))) {
+        print(fb, "Usage: exec <path> [args...]\n");
+        return;
+    }
+
+    (void)run_kxe_command(fb, raw, cur, false);
 }
 
 static void cmd_usertest(struct limine_framebuffer* fb) {
@@ -1988,6 +2466,36 @@ static void execute_command(struct limine_framebuffer *fb, char *input) {
         return;
     }
 
+    if (strcmp(input, "usb") == 0) {
+        cmd_usb(fb);
+        return;
+    }
+
+    if (strcmp(input, "acpi") == 0) {
+        cmd_acpi(fb);
+        return;
+    }
+
+    if (strcmp(input, "apic") == 0) {
+        cmd_apic(fb);
+        return;
+    }
+
+    if (strcmp(input, "hpet") == 0) {
+        cmd_hpet(fb);
+        return;
+    }
+
+    if (strcmp(input, "reboot") == 0) {
+        cmd_reboot(fb);
+        return;
+    }
+
+    if (strcmp(input, "poweroff") == 0 || strcmp(input, "shutdown") == 0) {
+        cmd_poweroff(fb);
+        return;
+    }
+
     if (strcmp(input, "diskreadp") == 0) {
         cmd_diskreadp(fb, args);
         return;
@@ -2098,6 +2606,10 @@ static void execute_command(struct limine_framebuffer *fb, char *input) {
         return;
     }
 
+    if (run_kxe_command(fb, input, args, true)) {
+        return;
+    }
+
     // Command not found
     cmd_unknown(fb, input);
 }
@@ -2156,6 +2668,36 @@ static void replace_input_line(char *buffer, int *len, int *cursor,
     console_set_input_line("> ", buffer, (uint32_t)(*len), (uint32_t)(*cursor), true);
 }
 
+static int shell_getchar_hotplug(void) {
+    uint32_t idle_ticks = 0;
+
+    for (;;) {
+        int ch = keyboard_getchar_nonblocking();
+        if (ch >= 0 ||
+            ch == KEY_ARROW_UP || ch == KEY_ARROW_DOWN ||
+            ch == KEY_ARROW_LEFT || ch == KEY_ARROW_RIGHT) {
+            return ch;
+        }
+
+        if (ch == KEY_PAGE_UP) {
+            console_page_up();
+            continue;
+        }
+        if (ch == KEY_PAGE_DOWN) {
+            console_page_down();
+            continue;
+        }
+
+        idle_ticks++;
+        if (idle_ticks >= 10u) {
+            idle_ticks = 0;
+            (void)block_poll_hotplug();
+        }
+
+        asm volatile("hlt");
+    }
+}
+
 void shell_loop(struct limine_framebuffer *fb) {
     char input_buffer[INPUT_BUFFER_SIZE];
     int input_len = 0;
@@ -2168,7 +2710,7 @@ void shell_loop(struct limine_framebuffer *fb) {
     console_set_input_line("> ", input_buffer, 0, 0, true);
 
     while (1) {
-        int c = keyboard_getchar();
+        int c = shell_getchar_hotplug();
         if (c == KEY_ARROW_UP) {
             if (history_cursor == -1) {
                 history_scratch_len = input_len;

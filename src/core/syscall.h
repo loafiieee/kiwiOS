@@ -4,6 +4,7 @@
 #include <stdbool.h>
 #include <stdint.h>
 #include "abi/kiwi.h"
+#include "core/process.h"
 
 typedef struct {
     uint64_t syscall_num;   // RAX
@@ -34,6 +35,8 @@ int64_t sys_brk(uint64_t addr);
 int64_t sys_getpid(void);
 int64_t sys_exec(const char* path);
 int64_t sys_spawn(const char* path);
+int64_t sys_exec_argv(const char* path, uint64_t argc, const char* const* argv);
+int64_t sys_spawn_argv(const char* path, uint64_t argc, const char* const* argv);
 int64_t sys_waitpid(int pid, int* status);
 int64_t sys_stat(const char* path, kiwi_stat_t* out);
 int64_t sys_readdir(const char* path, uint64_t index, kiwi_dirent_t* out);
@@ -43,6 +46,22 @@ int64_t sys_mkdir(const char* path, uint32_t mode);
 int64_t sys_unlink(const char* path);
 int64_t sys_mount(const char* source, const char* target);
 int64_t sys_dev_rescan(void);
+int64_t sys_ioctl(int fd, uint64_t request, void* arg);
+int64_t sys_chdir(const char* path);
+int64_t sys_getcwd(char* buf, uint64_t size);
+int64_t sys_rename(const char* old_path, const char* new_path);
+int64_t sys_truncate(const char* path, uint64_t size);
+int64_t sys_ftruncate(int fd, uint64_t size);
+int64_t sys_fstat(int fd, kiwi_stat_t* out);
+int64_t sys_access(const char* path, int mode);
+int64_t sys_dup(int oldfd);
+int64_t sys_dup2(int oldfd, int newfd);
+int64_t sys_fcntl(int fd, int cmd, uint64_t arg);
+int64_t sys_pipe(int* fds);
+int64_t sys_clock_gettime(int clock_id, kiwi_timespec_t* out);
+int64_t sys_poweroff(void);
+int64_t sys_reboot(void);
+void syscall_fd_release_resources(process_fd_t* entry);
 int64_t sys_console_input(const char* prefix, const char* text, uint64_t text_len, uint64_t cursor_pos, uint64_t show_cursor);
 int64_t sys_console_clear(void);
 int64_t sys_write(int fd, const void* buf, uint64_t len);

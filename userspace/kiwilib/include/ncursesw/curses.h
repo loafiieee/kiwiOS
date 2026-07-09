@@ -1,0 +1,6 @@
+#ifndef KIWILIB_NCURSESW_CURSES_H
+#define KIWILIB_NCURSESW_CURSES_H
+
+#include "../curses.h"
+
+#endif // KIWILIB_NCURSESW_CURSES_H

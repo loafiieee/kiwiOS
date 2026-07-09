@@ -25,6 +25,7 @@ void console_get_colors(uint32_t *fg, uint32_t *bg);
 void console_page_up(void);
 void console_page_down(void);
 void console_set_scale(uint32_t scale);
+void console_get_size(uint32_t *rows, uint32_t *cols);
 
 void putc_fb(struct limine_framebuffer *fb, char c);
 void print(struct limine_framebuffer *fb, const char *s);

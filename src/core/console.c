@@ -33,6 +33,17 @@ static void reset_scrollback(void);
 static void clear_outputs(void);
 static void render_visible(void);
 static void redraw_input_cursor_cell(bool inverted);
+static void console_cursor_set_enabled(bool enabled);
+static void console_cursor_sync_to_text_cursor(void);
+
+static bool framebuffer_usable(const struct limine_framebuffer *fb) {
+    return fb &&
+           fb->address != 0 &&
+           fb->bpp == 32 &&
+           fb->width > 0 &&
+           fb->height > 0 &&
+           fb->pitch >= fb->width * 4u;
+}
 
 // Call this once early in kmain(), after Limine is ready.
 static void display_init(void) {
@@ -52,9 +63,8 @@ static void display_init(void) {
     for (uint32_t i = 0; i < g_fb_count; i++) {
         g_fbs[i] = resp->framebuffers[i];
 
-        // We assume 32-bpp linear RGB (Limine default GOP/VBE). Your code already assumes 32-bpp.
-        // If a display isn't 32-bpp, we just ignore it for safety.
-        if (g_fbs[i]->bpp != 32) {
+        // We assume 32-bpp linear RGB (Limine default GOP/VBE).
+        if (!framebuffer_usable(g_fbs[i])) {
             // Disable this output
             for (uint32_t j = i + 1; j < g_fb_count; j++) g_fbs[j-1] = g_fbs[j];
             g_fb_count--;
@@ -148,7 +158,10 @@ static uint32_t g_rows = 0;               // rows in the visible area
 static uint32_t g_head = 0;               // logical line 0 -> g_buffer[g_head]
 static uint32_t g_line_count = 0;         // number of valid lines in buffer
 static uint32_t g_view_offset = 0;        // how many lines up from the newest view is
+static uint32_t g_cursor_line = 0;        // logical cursor line
 static uint32_t g_cursor_col = 0;         // cursor column within the newest line
+static uint32_t g_saved_cursor_line = 0;
+static uint32_t g_saved_cursor_col = 0;
 static bool g_input_cursor_enabled = false;
 static bool g_input_cursor_visible = false;
 static uint32_t g_input_cursor_line = 0;
@@ -176,7 +189,10 @@ static void reset_scrollback(void) {
     g_head = 0;
     g_line_count = 1;
     g_view_offset = 0;
+    g_cursor_line = 0;
     g_cursor_col = 0;
+    g_saved_cursor_line = 0;
+    g_saved_cursor_col = 0;
     g_input_cursor_enabled = false;
     g_input_cursor_visible = false;
     g_input_cursor_line = 0;
@@ -210,9 +226,32 @@ static uint32_t view_start_line(void) {
     return g_line_count - g_rows - g_view_offset;
 }
 
+static void ensure_line_exists(uint32_t logical_line) {
+    while (logical_line >= g_line_count) {
+        if (g_line_count < SCROLLBACK_LINES) {
+            clear_line(g_line_count);
+            g_line_count++;
+            continue;
+        }
+
+        g_head = (g_head + 1) % SCROLLBACK_LINES;
+        clear_line(g_line_count - 1);
+        if (g_cursor_line > 0) {
+            g_cursor_line--;
+        }
+        if (g_saved_cursor_line > 0) {
+            g_saved_cursor_line--;
+        }
+        if (logical_line > 0) {
+            logical_line--;
+        }
+    }
+}
+
 static void clear_outputs(void) {
     for (uint32_t i = 0; i < g_fb_count; i++) {
         struct limine_framebuffer *out = g_fbs[i];
+        if (!framebuffer_usable(out)) continue;
         uint8_t *base = (uint8_t *)(uintptr_t)out->address;
         size_t pitch = (size_t)out->pitch;
         for (uint32_t y = 0; y < out->height; y++) {
@@ -228,6 +267,7 @@ static void draw_char_scaled(uint32_t x, uint32_t y, char c, uint32_t fg, uint32
 
     for (uint32_t i = 0; i < g_fb_count; i++) {
         struct limine_framebuffer *out = g_fbs[i];
+        if (!framebuffer_usable(out)) continue;
         if (x + CELL_W() > out->width || y + CELL_H() > out->height) continue;
 
         uint8_t  *base   = (uint8_t *)(uintptr_t)out->address;
@@ -287,46 +327,27 @@ static void render_visible(void) {
     }
 }
 
-static void scroll_view_up_one(void) {
-    const uint32_t step = CELL_H();
-    if (step == 0 || g_text_h_px < step) return;
-
-    for (uint32_t i = 0; i < g_fb_count; i++) {
-        struct limine_framebuffer *out = g_fbs[i];
-        uint8_t *base   = (uint8_t *)(uintptr_t)out->address;
-        size_t   pitch  = (size_t)out->pitch;
-
-        for (uint32_t y = 0; y + step < g_text_h_px; y++) {
-            uint8_t *dest = base + (size_t)y * pitch;
-            uint8_t *src  = dest + (size_t)step * pitch;
-            memmove(dest, src, (size_t)g_text_w_px * 4);
-        }
-
-        for (uint32_t y = g_text_h_px - step; y < g_text_h_px; y++) {
-            uint8_t *row = base + (size_t)y * pitch;
-            fill_row_span(row, g_text_w_px, bg_color);
-        }
-    }
-}
-
 static void new_line(void) {
-    if (g_line_count < SCROLLBACK_LINES) {
-        clear_line(g_line_count);
-        g_line_count++;
-    } else {
-        g_head = (g_head + 1) % SCROLLBACK_LINES;
-        clear_line(g_line_count - 1);
+    if (g_cursor_line + 1u < g_line_count) {
+        g_cursor_line++;
+        g_cursor_col = 0;
+        if (g_view_offset == 0) {
+            render_visible();
+        }
+        return;
     }
 
+    ensure_line_exists(g_line_count);
+    g_cursor_line = g_line_count - 1u;
     g_cursor_col = 0;
 
     if (g_view_offset == 0) {
-        if (g_line_count > g_rows) {
-            scroll_view_up_one();
-            render_line_to_row(g_line_count - 1, g_rows - 1);
-        } else {
-            render_visible();
-        }
+        /* Repaint the visible area from the RAM cell buffer instead of doing a
+         * VRAM->VRAM scroll. Reading back video memory is extremely slow on real
+         * hardware and VMware (the framebuffer is uncached/write-combining), so
+         * the old memmove-based scroll stalled for seconds per line. render_visible()
+         * only writes to VRAM, matching the fast Page Up/Down repaint path. */
+        render_visible();
     } else {
         (void)view_start_line();
     }
@@ -375,6 +396,15 @@ void console_clear(void) {
     reset_scrollback();
     clear_outputs();
     render_visible();
+}
+
+void console_get_size(uint32_t *rows, uint32_t *cols) {
+    if (rows) {
+        *rows = g_rows;
+    }
+    if (cols) {
+        *cols = g_cols;
+    }
 }
 
 void console_set_input_line(const char *prefix,
@@ -428,6 +458,7 @@ void console_set_input_line(const char *prefix,
         g_buffer[idx][col].bg = bg_color;
     }
 
+    g_cursor_line = logical_line;
     g_cursor_col = col;
     g_input_cursor_enabled = show_cursor && cursor_col < g_cols;
     g_input_cursor_line = logical_line;
@@ -461,6 +492,40 @@ void console_timer_tick(void) {
     g_input_cursor_ticks = 0;
     g_input_cursor_visible = !g_input_cursor_visible;
     redraw_input_cursor_cell(g_input_cursor_visible);
+}
+
+static void console_cursor_set_enabled(bool enabled) {
+    if (g_input_cursor_visible) {
+        redraw_input_cursor_cell(false);
+        g_input_cursor_visible = false;
+    }
+
+    g_input_cursor_enabled = enabled;
+    g_input_cursor_line = g_cursor_line;
+    g_input_cursor_col = g_cursor_col;
+    g_input_cursor_ticks = 0;
+
+    if (enabled) {
+        redraw_input_cursor_cell(true);
+        g_input_cursor_visible = true;
+    }
+}
+
+static void console_cursor_sync_to_text_cursor(void) {
+    if (!g_input_cursor_enabled) {
+        return;
+    }
+
+    if (g_input_cursor_visible) {
+        redraw_input_cursor_cell(false);
+        g_input_cursor_visible = false;
+    }
+
+    g_input_cursor_line = g_cursor_line;
+    g_input_cursor_col = g_cursor_col;
+    g_input_cursor_ticks = 0;
+    redraw_input_cursor_cell(true);
+    g_input_cursor_visible = true;
 }
 
 static void redraw_input_cursor_cell(bool inverted) {
@@ -508,10 +573,12 @@ void draw_char(struct limine_framebuffer *fb /*unused*/,
 static enum { ANSI_NORMAL, ANSI_ESC, ANSI_CSI } ansi_state = ANSI_NORMAL;
 static uint32_t ansi_params[8];
 static uint32_t ansi_param_count = 0;
+static bool ansi_private = false;
 
 static void ansi_reset_state(void) {
     ansi_state = ANSI_NORMAL;
     ansi_param_count = 0;
+    ansi_private = false;
     for (uint32_t i = 0; i < 8; i++) ansi_params[i] = 0;
 }
 
@@ -527,6 +594,12 @@ static void apply_sgr_params(void) {
         if (p == 0) {
             fg_color = DEFAULT_FG;
             bg_color = DEFAULT_BG;
+        } else if (p == 1) {
+            fg_color = ansi_palette[15];
+        } else if (p == 7 || p == 27) {
+            uint32_t tmp = fg_color;
+            fg_color = bg_color;
+            bg_color = tmp;
         } else if (p == 39) {
             fg_color = DEFAULT_FG;
         } else if (p == 49) {
@@ -543,6 +616,194 @@ static void apply_sgr_params(void) {
     }
 }
 
+static uint32_t ansi_param_or(uint32_t index, uint32_t fallback) {
+    if (index >= ansi_param_count || ansi_params[index] == 0) {
+        return fallback;
+    }
+    return ansi_params[index];
+}
+
+static void render_line_if_visible(uint32_t logical_line) {
+    uint32_t start = view_start_line();
+    if (logical_line >= start && logical_line < start + g_rows) {
+        render_line_to_row(logical_line, logical_line - start);
+    }
+}
+
+static void blank_cell(uint32_t logical_line, uint32_t col) {
+    uint32_t idx = wrap_line(logical_line);
+    if (col >= g_cols) {
+        return;
+    }
+
+    g_buffer[idx][col].ch = ' ';
+    g_buffer[idx][col].fg = fg_color;
+    g_buffer[idx][col].bg = bg_color;
+}
+
+static void ansi_set_cursor(uint32_t row, uint32_t col) {
+    uint32_t start = view_start_line();
+    uint32_t target_line = start;
+
+    if (row == 0) {
+        row = 1;
+    }
+    if (col == 0) {
+        col = 1;
+    }
+    if (row > g_rows) {
+        row = g_rows;
+    }
+    if (col > g_cols) {
+        col = g_cols;
+    }
+
+    target_line = start + row - 1u;
+    ensure_line_exists(target_line);
+    g_cursor_line = target_line;
+    g_cursor_col = col - 1u;
+    console_cursor_sync_to_text_cursor();
+}
+
+static void ansi_move_cursor(char final) {
+    uint32_t amount = ansi_param_or(0, 1);
+    uint32_t start = view_start_line();
+    uint32_t bottom = start + ((g_rows > 0) ? (g_rows - 1u) : 0);
+
+    switch (final) {
+        case 'A':
+            if (amount > g_cursor_line) {
+                g_cursor_line = 0;
+            } else {
+                g_cursor_line -= amount;
+            }
+            if (g_cursor_line < start) {
+                g_cursor_line = start;
+            }
+            break;
+        case 'B':
+            g_cursor_line += amount;
+            if (g_cursor_line > bottom) {
+                g_cursor_line = bottom;
+            }
+            ensure_line_exists(g_cursor_line);
+            break;
+        case 'C':
+            g_cursor_col += amount;
+            if (g_cursor_col >= g_cols) {
+                g_cursor_col = g_cols - 1u;
+            }
+            break;
+        case 'D':
+            if (amount > g_cursor_col) {
+                g_cursor_col = 0;
+            } else {
+                g_cursor_col -= amount;
+            }
+            break;
+    }
+
+    console_cursor_sync_to_text_cursor();
+}
+
+static void ansi_erase_line(uint32_t mode) {
+    ensure_line_exists(g_cursor_line);
+
+    if (mode == 2) {
+        for (uint32_t col = 0; col < g_cols; col++) {
+            blank_cell(g_cursor_line, col);
+        }
+    } else if (mode == 1) {
+        for (uint32_t col = 0; col <= g_cursor_col && col < g_cols; col++) {
+            blank_cell(g_cursor_line, col);
+        }
+    } else {
+        for (uint32_t col = g_cursor_col; col < g_cols; col++) {
+            blank_cell(g_cursor_line, col);
+        }
+    }
+
+    render_line_if_visible(g_cursor_line);
+}
+
+static void ansi_erase_display(uint32_t mode) {
+    uint32_t start = view_start_line();
+    uint32_t end = start + g_rows;
+
+    if (mode == 2 || mode == 3) {
+        reset_scrollback();
+        clear_outputs();
+        render_visible();
+        return;
+    }
+
+    for (uint32_t line = start; line < end; line++) {
+        ensure_line_exists(line);
+        for (uint32_t col = 0; col < g_cols; col++) {
+            if (mode == 1) {
+                if (line > g_cursor_line || (line == g_cursor_line && col > g_cursor_col)) {
+                    continue;
+                }
+            } else {
+                if (line < g_cursor_line || (line == g_cursor_line && col < g_cursor_col)) {
+                    continue;
+                }
+            }
+            blank_cell(line, col);
+        }
+    }
+
+    render_visible();
+}
+
+static void ansi_handle_csi(char final) {
+    if (ansi_private) {
+        if (final == 'h' || final == 'l') {
+            for (uint32_t i = 0; i < ansi_param_count; i++) {
+                if (ansi_params[i] == 25) {
+                    console_cursor_set_enabled(final == 'h');
+                }
+            }
+        }
+        // Other private modes, including alternate-screen toggles, are no-ops for now.
+        return;
+    }
+
+    switch (final) {
+        case 'm':
+            apply_sgr_params();
+            break;
+        case 'H':
+        case 'f':
+            ansi_set_cursor(ansi_param_or(0, 1), ansi_param_or(1, 1));
+            break;
+        case 'A':
+        case 'B':
+        case 'C':
+        case 'D':
+            ansi_move_cursor(final);
+            break;
+        case 'G':
+            ansi_set_cursor((g_cursor_line - view_start_line()) + 1u, ansi_param_or(0, 1));
+            break;
+        case 'J':
+            ansi_erase_display(ansi_param_or(0, 0));
+            break;
+        case 'K':
+            ansi_erase_line(ansi_param_or(0, 0));
+            break;
+        case 's':
+            g_saved_cursor_line = g_cursor_line;
+            g_saved_cursor_col = g_cursor_col;
+            break;
+        case 'u':
+            ensure_line_exists(g_saved_cursor_line);
+            g_cursor_line = g_saved_cursor_line;
+            g_cursor_col = (g_saved_cursor_col < g_cols) ? g_saved_cursor_col : (g_cols - 1u);
+            break;
+    }
+}
+
 // Draw char at cursor (advances cursor) — mirrored to all outputs
 void putc_fb(struct limine_framebuffer *fb /*unused*/, char c) {
     (void)fb;
@@ -552,6 +813,18 @@ void putc_fb(struct limine_framebuffer *fb /*unused*/, char c) {
             ansi_state = ANSI_CSI;
             ansi_param_count = 0;
             ansi_params[0] = 0;
+        } else if (c == '7') {
+            g_saved_cursor_line = g_cursor_line;
+            g_saved_cursor_col = g_cursor_col;
+            ansi_reset_state();
+        } else if (c == '8') {
+            ensure_line_exists(g_saved_cursor_line);
+            g_cursor_line = g_saved_cursor_line;
+            g_cursor_col = (g_saved_cursor_col < g_cols) ? g_saved_cursor_col : (g_cols - 1u);
+            ansi_reset_state();
+        } else if (c == 'c') {
+            console_clear();
+            ansi_reset_state();
         } else {
             ansi_reset_state();
         }
@@ -559,6 +832,8 @@ void putc_fb(struct limine_framebuffer *fb /*unused*/, char c) {
     } else if (ansi_state == ANSI_CSI) {
         if (c >= '0' && c <= '9') {
             ansi_params[ansi_param_count] = ansi_params[ansi_param_count] * 10 + (uint32_t)(c - '0');
+        } else if (c == '?') {
+            ansi_private = true;
         } else if (c == ';') {
             if (ansi_param_count + 1 < 8) {
                 ansi_param_count++;
@@ -566,9 +841,7 @@ void putc_fb(struct limine_framebuffer *fb /*unused*/, char c) {
             }
         } else {
             ansi_param_count++;
-            if (c == 'm') {
-                apply_sgr_params();
-            }
+            ansi_handle_csi(c);
             ansi_reset_state();
         }
         return;
@@ -576,11 +849,19 @@ void putc_fb(struct limine_framebuffer *fb /*unused*/, char c) {
 
     if (c == '\x1B') { ansi_state = ANSI_ESC; return; }
     if (c == '\n') { new_line(); return; }
+    if (c == '\r') { g_cursor_col = 0; return; }
+    if (c == '\t') {
+        uint32_t next_tab = (g_cursor_col + 8u) & ~7u;
+        while (g_cursor_col < next_tab) {
+            putc_fb(NULL, ' ');
+        }
+        return;
+    }
 
     if (c == '\b') {
         if (g_cursor_col > 0) {
             g_cursor_col--;
-            uint32_t logical_line = g_line_count - 1;
+            uint32_t logical_line = g_cursor_line;
             g_buffer[wrap_line(logical_line)][g_cursor_col].ch = ' ';
             g_buffer[wrap_line(logical_line)][g_cursor_col].fg = fg_color;
             g_buffer[wrap_line(logical_line)][g_cursor_col].bg = bg_color;
@@ -593,9 +874,14 @@ void putc_fb(struct limine_framebuffer *fb /*unused*/, char c) {
         return;
     }
 
-    if (g_cursor_col >= g_cols) new_line();
+    if ((uint8_t)c < 0x20u) {
+        return;
+    }
 
-    uint32_t logical_line = g_line_count - 1;
+    if (g_cursor_col >= g_cols) new_line();
+    ensure_line_exists(g_cursor_line);
+
+    uint32_t logical_line = g_cursor_line;
     uint32_t idx = wrap_line(logical_line);
     g_buffer[idx][g_cursor_col].ch = c;
     g_buffer[idx][g_cursor_col].fg = fg_color;

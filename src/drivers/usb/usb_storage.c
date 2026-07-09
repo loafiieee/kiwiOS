@@ -4,7 +4,9 @@
 
 #include "arch/x86/io.h"
 #include "core/log.h"
+#include "drivers/usb/ehci.h"
 #include "drivers/usb/usb_storage.h"
+#include "drivers/usb/xhci.h"
 #include "libc/string.h"
 #include "memory/hhdm.h"
 #include "memory/pmm.h"
@@ -12,6 +14,11 @@
 #define UHCI_MAX_CONTROLLERS 4u
 #define UHCI_MAX_STORAGE_DEVS 8u
 #define UHCI_PORTS_PER_CONTROLLER 2u
+#define UHCI_DMA_LIMIT 0x100000000ull
+#define USB_MAX_CONTROLLER_RECORDS 16u
+
+#define UHCI_PORT_EMPTY   (-1)
+#define UHCI_PORT_IGNORED (-2)
 
 #define UHCI_REG_USBCMD  0x00
 #define UHCI_REG_USBSTS  0x02
@@ -161,6 +168,9 @@ typedef struct {
 
 typedef struct {
     bool present;
+    const char* transport_name;
+    void* transport_ctx;
+    usb_bulk_transfer_fn bulk_transfer;
     uhci_controller_t* hc;
     uint8_t port;
     uint8_t address;
@@ -181,6 +191,78 @@ static uint32_t g_uhci_count = 0;
 static usb_storage_dev_t g_storage[UHCI_MAX_STORAGE_DEVS];
 static uint32_t g_storage_count = 0;
 static uint8_t g_next_usb_address = 1;
+static usb_controller_info_t g_controller_info[USB_MAX_CONTROLLER_RECORDS];
+static uint32_t g_controller_info_count = 0;
+
+const char* usb_controller_type_name(usb_controller_type_t type) {
+    switch (type) {
+        case USB_CONTROLLER_UHCI: return "UHCI";
+        case USB_CONTROLLER_OHCI: return "OHCI";
+        case USB_CONTROLLER_EHCI: return "EHCI";
+        case USB_CONTROLLER_XHCI: return "xHCI";
+        default:                  return "unknown";
+    }
+}
+
+void usb_note_controller(usb_controller_type_t type,
+                         uint8_t bus,
+                         uint8_t dev,
+                         uint8_t func,
+                         uint64_t base,
+                         bool mmio,
+                         bool supported) {
+    usb_controller_info_t* rec = NULL;
+
+    for (uint32_t i = 0; i < g_controller_info_count; i++) {
+        rec = &g_controller_info[i];
+        if (rec->bus == bus && rec->dev == dev && rec->func == func) {
+            rec->type = type;
+            rec->base = base;
+            rec->mmio = mmio;
+            rec->supported = supported;
+            return;
+        }
+    }
+
+    if (g_controller_info_count >= USB_MAX_CONTROLLER_RECORDS) {
+        log_error("usb", "USB controller record limit reached");
+        return;
+    }
+
+    rec = &g_controller_info[g_controller_info_count++];
+    rec->type = type;
+    rec->bus = bus;
+    rec->dev = dev;
+    rec->func = func;
+    rec->base = base;
+    rec->mmio = mmio;
+    rec->supported = supported;
+}
+
+uint32_t usb_controller_count(void) {
+    return g_controller_info_count;
+}
+
+bool usb_controller_info(uint32_t index, usb_controller_info_t* out) {
+    if (!out || index >= g_controller_info_count) {
+        return false;
+    }
+    *out = g_controller_info[index];
+    return true;
+}
+
+bool usb_storage_is_present(uint32_t index) {
+    return index < g_storage_count && g_storage[index].present;
+}
+
+void usb_storage_mark_removed(uint32_t index) {
+    if (index >= g_storage_count || !g_storage[index].present) {
+        return;
+    }
+
+    g_storage[index].present = false;
+    log_infof("usb", "USB storage disk %u removed", index);
+}
 
 static void tiny_delay(uint32_t loops) {
     for (volatile uint32_t i = 0; i < loops; i++) {
@@ -213,8 +295,9 @@ static bool dma_alloc_page(uint64_t* out_phys, uint8_t** out_virt) {
         return false;
     }
 
-    phys = pmm_alloc();
+    phys = pmm_alloc_below(UHCI_DMA_LIMIT);
     if (!phys) {
+        log_error("usb", "failed to allocate 32-bit DMA page");
         return false;
     }
 
@@ -464,6 +547,23 @@ static bool uhci_bulk(usb_storage_dev_t* dev,
     return ok;
 }
 
+static bool uhci_bot_bulk_transfer(void* ctx,
+                                   uint8_t endpoint_addr,
+                                   bool in,
+                                   uint64_t data_phys,
+                                   uint32_t len,
+                                   uint16_t max_packet) {
+    usb_storage_dev_t* dev = (usb_storage_dev_t*)ctx;
+    uint8_t* toggle = NULL;
+
+    if (!dev) {
+        return false;
+    }
+
+    toggle = in ? &dev->bulk_in_toggle : &dev->bulk_out_toggle;
+    return uhci_bulk(dev, endpoint_addr, in, data_phys, len, max_packet, toggle);
+}
+
 static uint32_t be32(const uint8_t* p) {
     return ((uint32_t)p[0] << 24) |
            ((uint32_t)p[1] << 16) |
@@ -517,34 +617,33 @@ static bool msc_command_dma(usb_storage_dev_t* dev,
     cbw->cdb_length = cdb_len;
     memcpy(cbw->cdb, cdb, cdb_len);
 
-    ok = uhci_bulk(dev,
-                   dev->bulk_out_ep,
-                   false,
-                   page_phys,
-                   sizeof(*cbw),
-                   dev->bulk_out_max_packet,
-                   &dev->bulk_out_toggle);
+    if (!dev->bulk_transfer) goto out;
+
+    ok = dev->bulk_transfer(dev->transport_ctx,
+                            dev->bulk_out_ep,
+                            false,
+                            page_phys,
+                            sizeof(*cbw),
+                            dev->bulk_out_max_packet);
     if (!ok) goto out;
 
     if (data_len != 0u) {
-        ok = uhci_bulk(dev,
-                       data_in ? dev->bulk_in_ep : dev->bulk_out_ep,
-                       data_in,
-                       data_phys,
-                       data_len,
-                       data_in ? dev->bulk_in_max_packet : dev->bulk_out_max_packet,
-                       data_in ? &dev->bulk_in_toggle : &dev->bulk_out_toggle);
+        ok = dev->bulk_transfer(dev->transport_ctx,
+                                data_in ? dev->bulk_in_ep : dev->bulk_out_ep,
+                                data_in,
+                                data_phys,
+                                data_len,
+                                data_in ? dev->bulk_in_max_packet : dev->bulk_out_max_packet);
         if (!ok) goto out;
     }
 
     memset(csw, 0, sizeof(*csw));
-    ok = uhci_bulk(dev,
-                   dev->bulk_in_ep,
-                   true,
-                   page_phys + 64u,
-                   sizeof(*csw),
-                   dev->bulk_in_max_packet,
-                   &dev->bulk_in_toggle);
+    ok = dev->bulk_transfer(dev->transport_ctx,
+                            dev->bulk_in_ep,
+                            true,
+                            page_phys + 64u,
+                            sizeof(*csw),
+                            dev->bulk_in_max_packet);
     if (!ok) goto out;
 
     if (csw->signature != CSW_SIGNATURE || csw->tag != tag || csw->status != 0u) {
@@ -667,6 +766,46 @@ static bool parse_mass_storage_config(const uint8_t* cfg,
 
     return *out_bulk_in != 0u && *out_bulk_out != 0u &&
            *out_bulk_in_mps != 0u && *out_bulk_out_mps != 0u;
+}
+
+bool usb_storage_register_bot(const usb_bot_transport_t* transport, uint32_t* out_index) {
+    usb_storage_dev_t* dev = NULL;
+
+    if (!transport || !transport->bulk_transfer ||
+        transport->bulk_in_ep == 0u || transport->bulk_out_ep == 0u ||
+        transport->bulk_in_max_packet == 0u || transport->bulk_out_max_packet == 0u ||
+        g_storage_count >= UHCI_MAX_STORAGE_DEVS) {
+        return false;
+    }
+
+    dev = &g_storage[g_storage_count];
+    memset(dev, 0, sizeof(*dev));
+    dev->present = true;
+    dev->transport_name = transport->transport_name;
+    dev->transport_ctx = transport->ctx;
+    dev->bulk_transfer = transport->bulk_transfer;
+    dev->address = transport->address;
+    dev->bulk_in_ep = transport->bulk_in_ep;
+    dev->bulk_out_ep = transport->bulk_out_ep;
+    dev->bulk_in_max_packet = transport->bulk_in_max_packet;
+    dev->bulk_out_max_packet = transport->bulk_out_max_packet;
+    dev->tag = 0x1000u + g_storage_count;
+
+    if (!msc_read_capacity(dev)) {
+        memset(dev, 0, sizeof(*dev));
+        return false;
+    }
+
+    if (out_index) {
+        *out_index = g_storage_count;
+    }
+    g_storage_count++;
+
+    log_okf("usb", "%s mass storage disk detected: addr=%u sectors=%x",
+            transport->transport_name ? transport->transport_name : "USB",
+            dev->address,
+            (uint32_t)dev->total_sectors);
+    return true;
 }
 
 static bool enumerate_storage_on_port(uhci_controller_t* hc, uint8_t port) {
@@ -810,6 +949,9 @@ static bool enumerate_storage_on_port(uhci_controller_t* hc, uint8_t port) {
     dev = &g_storage[g_storage_count];
     memset(dev, 0, sizeof(*dev));
     dev->present = true;
+    dev->transport_name = "UHCI";
+    dev->transport_ctx = dev;
+    dev->bulk_transfer = uhci_bot_bulk_transfer;
     dev->hc = hc;
     dev->port = port;
     dev->address = address;
@@ -829,7 +971,7 @@ static bool enumerate_storage_on_port(uhci_controller_t* hc, uint8_t port) {
 
     hc->port_dev[port] = (int8_t)g_storage_count;
     g_storage_count++;
-    log_okf("usb", "USB mass storage disk detected: addr=%u sectors=%x",
+    log_okf("usb", "UHCI mass storage disk detected: addr=%u sectors=%x",
             address,
             (uint32_t)dev->total_sectors);
     return true;
@@ -871,7 +1013,7 @@ void uhci_probe_pci(uint8_t bus, uint8_t dev, uint8_t func, uint16_t io_base) {
     hc->frame_list_phys = frame_phys;
     hc->frame_list = (volatile uint32_t*)frame_virt;
     for (uint32_t i = 0; i < UHCI_PORTS_PER_CONTROLLER; i++) {
-        hc->port_dev[i] = -1;
+        hc->port_dev[i] = UHCI_PORT_EMPTY;
     }
     for (uint32_t i = 0; i < 1024u; i++) {
         hc->frame_list[i] = UHCI_PTR_TERM;
@@ -892,7 +1034,7 @@ void uhci_probe_pci(uint8_t bus, uint8_t dev, uint8_t func, uint16_t io_base) {
     log_okf("usb", "UHCI controller registered io=%x", io_base);
 }
 
-uint32_t usb_storage_rescan(void) {
+static uint32_t usb_storage_rescan_common(bool force) {
     uint32_t added = 0;
 
     for (uint32_t i = 0; i < g_uhci_count; i++) {
@@ -903,25 +1045,66 @@ uint32_t usb_storage_rescan(void) {
 
         for (uint8_t port = 0; port < UHCI_PORTS_PER_CONTROLLER; port++) {
             uint16_t status = inw((uint16_t)(hc->io_base + uhci_port_reg(port)));
+            bool changed = (status & (UHCI_PORT_CSC | UHCI_PORT_PEC)) != 0u;
+
+            if (force && hc->port_dev[port] == UHCI_PORT_IGNORED) {
+                hc->port_dev[port] = UHCI_PORT_EMPTY;
+            }
+
+            if (changed) {
+                if (hc->port_dev[port] >= 0) {
+                    usb_storage_mark_removed((uint32_t)hc->port_dev[port]);
+                }
+                hc->port_dev[port] = UHCI_PORT_EMPTY;
+                outw((uint16_t)(hc->io_base + uhci_port_reg(port)),
+                     (uint16_t)(status | UHCI_PORT_CSC | UHCI_PORT_PEC));
+                status = inw((uint16_t)(hc->io_base + uhci_port_reg(port)));
+            }
 
             if ((status & UHCI_PORT_CCS) == 0u) {
-                hc->port_dev[port] = -1;
+                if (hc->port_dev[port] >= 0) {
+                    usb_storage_mark_removed((uint32_t)hc->port_dev[port]);
+                }
+                hc->port_dev[port] = UHCI_PORT_EMPTY;
                 outw((uint16_t)(hc->io_base + uhci_port_reg(port)),
                      (uint16_t)(status | UHCI_PORT_CSC | UHCI_PORT_PEC));
                 continue;
             }
 
-            if (hc->port_dev[port] >= 0) {
+            if (hc->port_dev[port] >= 0 &&
+                !usb_storage_is_present((uint32_t)hc->port_dev[port])) {
+                hc->port_dev[port] = UHCI_PORT_EMPTY;
+            }
+
+            if (hc->port_dev[port] >= 0 ||
+                (hc->port_dev[port] == UHCI_PORT_IGNORED && !force)) {
+                continue;
+            }
+
+            if ((status & UHCI_PORT_LSDA) != 0u) {
+                hc->port_dev[port] = UHCI_PORT_IGNORED;
                 continue;
             }
 
             if (enumerate_storage_on_port(hc, port)) {
                 added++;
+            } else {
+                hc->port_dev[port] = UHCI_PORT_IGNORED;
             }
         }
     }
 
+    added += force ? xhci_storage_rescan_force() : xhci_storage_rescan();
+    added += force ? ehci_storage_rescan_force() : ehci_storage_rescan();
     return added;
+}
+
+uint32_t usb_storage_rescan(void) {
+    return usb_storage_rescan_common(false);
+}
+
+uint32_t usb_storage_full_rescan(void) {
+    return usb_storage_rescan_common(true);
 }
 
 uint32_t usb_storage_disk_count(void) {

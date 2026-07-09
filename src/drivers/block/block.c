@@ -53,12 +53,17 @@ static uint32_t       g_part_count = 0;
 
 static part_table_type_t g_boot_part_table = PART_TABLE_NONE;
 
+static void sync_disk_presence(block_device_t* dev);
+static void sync_all_device_presence(void);
+
 // ---------------- disk device ops ----------------
 
 static bool disk_read(block_device_t* dev, uint64_t lba, uint32_t count, void* buffer) {
     disk_ctx_t* ctx = NULL;
 
     if (!dev || !dev->ctx) return false;
+    sync_disk_presence(dev);
+    if (!dev->present) return false;
     ctx = (disk_ctx_t*)dev->ctx;
     switch (ctx->backend) {
         case DISK_BACKEND_AHCI:
@@ -74,6 +79,8 @@ static bool disk_write(block_device_t* dev, uint64_t lba, uint32_t count, const 
     disk_ctx_t* ctx = NULL;
 
     if (!dev || !dev->ctx) return false;
+    sync_disk_presence(dev);
+    if (!dev->present) return false;
     ctx = (disk_ctx_t*)dev->ctx;
     switch (ctx->backend) {
         case DISK_BACKEND_AHCI:
@@ -89,6 +96,8 @@ static bool disk_flush(block_device_t* dev) {
     disk_ctx_t* ctx = NULL;
 
     if (!dev || !dev->ctx) return false;
+    sync_disk_presence(dev);
+    if (!dev->present) return false;
     ctx = (disk_ctx_t*)dev->ctx;
     switch (ctx->backend) {
         case DISK_BACKEND_AHCI:
@@ -110,6 +119,9 @@ static bool part_read(block_device_t* dev, uint64_t lba, uint32_t count, void* b
 
     if (!p->parent || !p->parent->read) return false;
     if (count == 0) return false;
+    sync_disk_presence(p->parent);
+    dev->present = p->parent->present;
+    if (!dev->present) return false;
 
     if (p->lba_count != 0) {
         if (lba >= p->lba_count) return false;
@@ -127,6 +139,9 @@ static bool part_write(block_device_t* dev, uint64_t lba, uint32_t count, const 
 
     if (!p->parent || !p->parent->write) return false;
     if (count == 0) return false;
+    sync_disk_presence(p->parent);
+    dev->present = p->parent->present;
+    if (!dev->present) return false;
 
     if (p->lba_count != 0) {
         if (lba >= p->lba_count) return false;
@@ -142,6 +157,9 @@ static bool part_flush(block_device_t* dev) {
     if (!dev || !dev->ctx) return false;
     p = (part_ctx_t*)dev->ctx;
     if (!p->parent || !p->parent->flush) return true;
+    sync_disk_presence(p->parent);
+    dev->present = p->parent->present;
+    if (!dev->present) return false;
     return p->parent->flush(p->parent);
 }
 
@@ -214,6 +232,59 @@ static void make_part_name(part_ctx_t* ctx, const char* parent_name, uint32_t pa
     ctx->name_buf[j] = '\0';
 }
 
+static bool disk_backend_present(const disk_ctx_t* ctx) {
+    if (!ctx) {
+        return false;
+    }
+
+    switch (ctx->backend) {
+        case DISK_BACKEND_AHCI:
+            return true;
+        case DISK_BACKEND_USB_STORAGE:
+            return usb_storage_is_present(ctx->backend_index);
+        default:
+            return false;
+    }
+}
+
+static void sync_disk_presence(block_device_t* dev) {
+    disk_ctx_t* ctx = NULL;
+
+    if (!dev || !dev->ctx) {
+        return;
+    }
+
+    ctx = (disk_ctx_t*)dev->ctx;
+    dev->present = disk_backend_present(ctx);
+}
+
+static void sync_part_presence(block_device_t* dev) {
+    part_ctx_t* part = NULL;
+
+    if (!dev || !dev->ctx) {
+        return;
+    }
+
+    part = (part_ctx_t*)dev->ctx;
+    if (!part->parent) {
+        dev->present = false;
+        return;
+    }
+
+    sync_disk_presence(part->parent);
+    dev->present = part->parent->present;
+    dev->removable = part->parent->removable;
+}
+
+static void sync_all_device_presence(void) {
+    for (uint32_t i = 0; i < g_disk_count; i++) {
+        sync_disk_presence(&g_disks[i]);
+    }
+    for (uint32_t i = 0; i < g_part_count; i++) {
+        sync_part_presence(&g_parts[i]);
+    }
+}
+
 static block_device_t* register_disk(disk_backend_t backend, uint32_t backend_index) {
     disk_ctx_t* ctx = NULL;
     block_device_t* dev = NULL;
@@ -247,6 +318,8 @@ static block_device_t* register_disk(disk_backend_t backend, uint32_t backend_in
     dev->name = ctx->name_buf;
     dev->sector_size = 512u;
     dev->total_sectors = total_sectors;
+    dev->present = disk_backend_present(ctx);
+    dev->removable = (backend == DISK_BACKEND_USB_STORAGE);
     dev->ctx = ctx;
     dev->read = disk_read;
     dev->write = disk_write;
@@ -296,6 +369,8 @@ static void register_partition(block_device_t* parent,
     d->name = c->name_buf;
     d->sector_size = parent->sector_size;
     d->total_sectors = count;
+    d->present = parent->present;
+    d->removable = parent->removable;
     d->ctx = c;
     d->read = part_read;
     d->write = part_write;
@@ -626,6 +701,10 @@ void block_init(void) {
         if (!ctx) {
             continue;
         }
+        sync_disk_presence(&g_disks[i]);
+        if (!g_disks[i].present) {
+            continue;
+        }
         ctx->part_table = probe_partitions_for_disk(&g_disks[i]);
         if (i == 0u) {
             g_boot_part_table = ctx->part_table;
@@ -638,8 +717,10 @@ uint32_t block_rescan(void) {
     uint32_t usb_count = 0;
     uint32_t added = 0;
 
+    sync_all_device_presence();
     pci_enumerate_and_log();
-    (void)usb_storage_rescan();
+    (void)usb_storage_full_rescan();
+    sync_all_device_presence();
 
     ahci_count = ahci_disk_count();
     usb_count = usb_storage_disk_count();
@@ -657,7 +738,7 @@ uint32_t block_rescan(void) {
                 dev->sector_size);
 
         ctx = (disk_ctx_t*)dev->ctx;
-        if (ctx) {
+        if (ctx && dev->present) {
             ctx->part_table = probe_partitions_for_disk(dev);
             if (i == 0u) {
                 g_boot_part_table = ctx->part_table;
@@ -681,7 +762,7 @@ uint32_t block_rescan(void) {
                 dev->sector_size);
 
         ctx = (disk_ctx_t*)dev->ctx;
-        if (ctx) {
+        if (ctx && dev->present) {
             ctx->part_table = probe_partitions_for_disk(dev);
         }
 
@@ -702,7 +783,9 @@ uint32_t block_poll_hotplug(void) {
 
     // Poll only hotplug-capable transports here. Full PCI rescans stay in
     // block_rescan(), because this can run from scheduler idle paths.
+    sync_all_device_presence();
     (void)usb_storage_rescan();
+    sync_all_device_presence();
     usb_count = usb_storage_disk_count();
 
     for (uint32_t i = g_registered_usb_count; i < usb_count && g_disk_count < MAX_DISKS; i++) {
@@ -718,7 +801,7 @@ uint32_t block_poll_hotplug(void) {
                 dev->sector_size);
 
         ctx = (disk_ctx_t*)dev->ctx;
-        if (ctx) {
+        if (ctx && dev->present) {
             ctx->part_table = probe_partitions_for_disk(dev);
         }
 
@@ -735,15 +818,41 @@ uint32_t block_poll_hotplug(void) {
 
 block_device_t* block_boot_device(void) {
     if (!g_ready || g_disk_count == 0u) return 0;
+    sync_all_device_presence();
     return &g_disks[0];
 }
 
+bool block_device_is_present(block_device_t* dev) {
+    if (!dev) {
+        return false;
+    }
+
+    if (dev->ctx) {
+        for (uint32_t i = 0; i < g_part_count; i++) {
+            if (&g_parts[i] == dev) {
+                sync_part_presence(dev);
+                return dev->present;
+            }
+        }
+
+        sync_disk_presence(dev);
+    }
+
+    return dev->present;
+}
+
+bool block_device_is_removable(const block_device_t* dev) {
+    return dev && dev->removable;
+}
+
 uint32_t block_disk_count(void) {
+    sync_all_device_presence();
     return g_disk_count;
 }
 
 block_device_t* block_disk_device(uint32_t index) {
     if (index >= g_disk_count) return 0;
+    sync_disk_presence(&g_disks[index]);
     return &g_disks[index];
 }
 
@@ -752,14 +861,16 @@ block_device_t* block_device_by_name(const char* name) {
         return NULL;
     }
 
+    sync_all_device_presence();
+
     for (uint32_t i = 0; i < g_disk_count; i++) {
-        if (g_disks[i].name && strcmp(g_disks[i].name, name) == 0) {
+        if (g_disks[i].present && g_disks[i].name && strcmp(g_disks[i].name, name) == 0) {
             return &g_disks[i];
         }
     }
 
     for (uint32_t i = 0; i < g_part_count; i++) {
-        if (g_parts[i].name && strcmp(g_parts[i].name, name) == 0) {
+        if (g_parts[i].present && g_parts[i].name && strcmp(g_parts[i].name, name) == 0) {
             return &g_parts[i];
         }
     }
@@ -768,11 +879,13 @@ block_device_t* block_device_by_name(const char* name) {
 }
 
 uint32_t block_partition_count(void) {
+    sync_all_device_presence();
     return g_part_count;
 }
 
 block_device_t* block_partition_device(uint32_t index) {
     if (index >= g_part_count) return 0;
+    sync_part_presence(&g_parts[index]);
     return &g_parts[index];
 }
 
@@ -784,13 +897,14 @@ block_device_t* block_partition_lookup(uint32_t disk_index, uint32_t part_number
     }
 
     disk = block_disk_device(disk_index);
-    if (!disk) {
+    if (!disk || !disk->present) {
         return NULL;
     }
 
     for (uint32_t i = 0; i < g_part_count; i++) {
         if (g_part_ctx[i].parent == disk &&
-            g_part_ctx[i].part_number_one_based == part_number_one_based) {
+            g_part_ctx[i].part_number_one_based == part_number_one_based &&
+            g_parts[i].present) {
             return &g_parts[i];
         }
     }
@@ -804,6 +918,10 @@ part_table_type_t block_partition_table_type(void) {
 
 part_table_type_t block_disk_partition_table_type(uint32_t disk_index) {
     if (disk_index >= g_disk_count) {
+        return PART_TABLE_NONE;
+    }
+    sync_disk_presence(&g_disks[disk_index]);
+    if (!g_disks[disk_index].present) {
         return PART_TABLE_NONE;
     }
     return g_disk_ctx[disk_index].part_table;

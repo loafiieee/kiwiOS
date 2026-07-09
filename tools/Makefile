@@ -3,7 +3,7 @@
 CC ?= cc
 CFLAGS ?= -g -O2 -Wall -Wextra -std=gnu11
 
-TOOLS := elf2kxe kifs_cp mkfs_kifs
+TOOLS := elf2kxe kifs_cp mkfs_kifs kxeinfo
 
 all: $(TOOLS)
 
@@ -15,6 +15,9 @@ kifs_cp: kifs_cp.c
 
 mkfs_kifs: mkfs_kifs.c
 	$(CC) $(CFLAGS) -I ../src $< -o $@
+
+kxeinfo: kxeinfo.c
+	$(CC) $(CFLAGS) $< -o $@
 
 clean:
 	rm -f $(TOOLS)

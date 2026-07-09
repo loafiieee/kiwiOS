@@ -734,7 +734,16 @@ static bool scan_dir_block(const uint8_t* blk, const char* name, dir_scan_t* out
             break;
         }
 
-        if (ino != 0) {
+        if (ino == 0) {
+            if (name) {
+                uint16_t need_rec = dir_rec_len((uint8_t)strlen(name));
+                if (reclen >= need_rec) {
+                    out->last_off = off;
+                    out->last_reclen = reclen;
+                    out->last_min_reclen = 0;
+                }
+            }
+        } else {
             char cur_name[256];
             memcpy(cur_name, p + 8, namelen);
             cur_name[namelen] = '\0';
@@ -880,13 +889,22 @@ static bool ensure_dir_entry(kifs_image_t* fs,
             return false;
         }
 
-        *(uint16_t*)(dirblk + scan.last_off + 4u) = scan.last_min_reclen;
-        dir_write_entry(dirblk,
-                        scan.last_off + scan.last_min_reclen,
-                        ino,
-                        name,
-                        ftype,
-                        (uint16_t)(scan.last_reclen - scan.last_min_reclen));
+        if (scan.last_min_reclen == 0u) {
+            dir_write_entry(dirblk,
+                            scan.last_off,
+                            ino,
+                            name,
+                            ftype,
+                            scan.last_reclen);
+        } else {
+            *(uint16_t*)(dirblk + scan.last_off + 4u) = scan.last_min_reclen;
+            dir_write_entry(dirblk,
+                            scan.last_off + scan.last_min_reclen,
+                            ino,
+                            name,
+                            ftype,
+                            (uint16_t)(scan.last_reclen - scan.last_min_reclen));
+        }
     }
 
     update_dir_checksum(fs, dirblk);

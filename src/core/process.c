@@ -2,6 +2,7 @@
 #include <stddef.h>
 #include <stdint.h>
 #include "arch/x86/syscall.h"
+#include "core/syscall.h"
 #include "arch/x86/tss.h"
 #include "libc/string.h"
 #include "memory/heap.h"
@@ -82,6 +83,12 @@ process_t* process_create(const char* name) {
     proc->pid = g_next_pid++;
     proc->ppid = g_current ? g_current->pid : 0;
     copy_name(proc->name, name);
+    if (g_current && g_current->cwd[0]) {
+        memcpy(proc->cwd, g_current->cwd, sizeof(proc->cwd));
+    } else {
+        proc->cwd[0] = '/';
+        proc->cwd[1] = '\0';
+    }
     proc->state = PROC_READY;
     proc->exit_code = 0;
     proc->resume_kind = PROC_RESUME_USER;
@@ -123,9 +130,7 @@ void process_close_files(process_t* proc) {
     }
 
     for (uint32_t i = 0; i < PROC_MAX_FDS; i++) {
-        if (proc->fds[i].used && proc->fds[i].vnode) {
-            vfs_vnode_put(proc->fds[i].vnode);
-        }
+        syscall_fd_release_resources(&proc->fds[i]);
         memset(&proc->fds[i], 0, sizeof(proc->fds[i]));
     }
 }
@@ -183,6 +188,31 @@ process_t* process_by_pid(uint32_t pid) {
     }
 
     return NULL;
+}
+
+process_t* process_first_child(uint32_t ppid, bool prefer_zombie) {
+    process_t* first = NULL;
+
+    if (ppid == 0) {
+        return NULL;
+    }
+
+    for (uint32_t i = 0; i < PROC_MAX; i++) {
+        process_t* proc = &g_procs[i];
+        if (proc->state == PROC_UNUSED || proc->ppid != ppid) {
+            continue;
+        }
+
+        if (prefer_zombie && proc->state == PROC_ZOMBIE) {
+            return proc;
+        }
+
+        if (!first) {
+            first = proc;
+        }
+    }
+
+    return first;
 }
 
 void process_set_current(process_t* proc) {

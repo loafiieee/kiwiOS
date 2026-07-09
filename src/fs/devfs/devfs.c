@@ -46,6 +46,7 @@ static bool devfs_make_root_alias(vnode_t* dir, vnode_t** out) {
     }
 
     *vn = *dir->mount->root;
+    vn->refcount = 1;
     *out = vn;
     return true;
 }
@@ -103,7 +104,7 @@ static bool devfs_lookup_block_name(const char* name, uint32_t* out_ino, block_d
     disk_count = block_disk_count();
     for (uint32_t i = 0; i < disk_count; i++) {
         block_device_t* dev = block_disk_device(i);
-        if (!dev || !dev->name) {
+        if (!dev || !dev->name || !block_device_is_present(dev)) {
             continue;
         }
         if (strcmp(dev->name, name) == 0) {
@@ -116,7 +117,7 @@ static bool devfs_lookup_block_name(const char* name, uint32_t* out_ino, block_d
     part_count = block_partition_count();
     for (uint32_t i = 0; i < part_count; i++) {
         block_device_t* dev = block_partition_device(i);
-        if (!dev || !dev->name) {
+        if (!dev || !dev->name || !block_device_is_present(dev)) {
             continue;
         }
         if (strcmp(dev->name, name) == 0) {
@@ -171,7 +172,7 @@ static bool devfs_vnode_readdir(vnode_t* dir, vfs_readdir_cb cb, void* user) {
     disk_count = block_disk_count();
     for (uint32_t i = 0; i < disk_count; i++) {
         block_device_t* dev = block_disk_device(i);
-        if (!dev || !dev->name) {
+        if (!dev || !dev->name || !block_device_is_present(dev)) {
             continue;
         }
         if (!cb(dev->name, 0x100u + i, user)) {
@@ -182,7 +183,7 @@ static bool devfs_vnode_readdir(vnode_t* dir, vfs_readdir_cb cb, void* user) {
     part_count = block_partition_count();
     for (uint32_t i = 0; i < part_count; i++) {
         block_device_t* dev = block_partition_device(i);
-        if (!dev || !dev->name) {
+        if (!dev || !dev->name || !block_device_is_present(dev)) {
             continue;
         }
         if (!cb(dev->name, 0x200u + i, user)) {

@@ -11,6 +11,13 @@ make
 make -C tools all
 make -C userspace all
 
+if [ "${KIWI_BUILD_NANO:-0}" = "1" ]; then
+  bash ports/nano/build.sh
+elif [ -f "ports/nano/build/nano" ]; then
+  mkdir -p userspace/bin
+  cp -f ports/nano/build/nano userspace/bin/nano
+fi
+
 DISK_IMAGE="disk.img"
 DISK_ATTACH_OK=0
 DISK_INSTALL_OK=0
@@ -106,6 +113,17 @@ install_program_specs() {
   return "$failures"
 }
 
+install_optional_program() {
+  local src="$1"
+  local dst="$2"
+
+  if [ ! -f "$src" ]; then
+    return 0
+  fi
+
+  install_program "$src" "$dst" || true
+}
+
 prepare_disk_image "$DISK_IMAGE"
 
 if [ "$DISK_INSTALL_OK" = "1" ]; then
@@ -119,7 +137,33 @@ if [ "$DISK_INSTALL_OK" = "1" ]; then
     "userspace/bin/writetest:/bin/writetest" \
     "userspace/bin/preempt_a:/bin/preempt_a" \
     "userspace/bin/preempt_b:/bin/preempt_b" \
-    "userspace/bin/preempttest:/bin/preempttest"; then
+    "userspace/bin/preempttest:/bin/preempttest" \
+    "userspace/bin/argtest:/bin/argtest" \
+    "userspace/bin/termtest:/bin/termtest" \
+    "userspace/bin/alloctest:/bin/alloctest" \
+    "userspace/bin/cwdtest:/bin/cwdtest" \
+    "userspace/bin/libctest:/bin/libctest" \
+    "userspace/bin/edit:/bin/edit" \
+    "userspace/bin/cursestest:/bin/cursestest" \
+    "userspace/bin/echo:/bin/echo" \
+    "userspace/bin/clear:/bin/clear" \
+    "userspace/bin/pwd:/bin/pwd" \
+    "userspace/bin/cat:/bin/cat" \
+    "userspace/bin/ls:/bin/ls" \
+    "userspace/bin/stat:/bin/stat" \
+    "userspace/bin/which:/bin/which" \
+    "userspace/bin/touch:/bin/touch" \
+    "userspace/bin/mkdir:/bin/mkdir" \
+    "userspace/bin/rmdir:/bin/rmdir" \
+    "userspace/bin/rm:/bin/rm" \
+    "userspace/bin/cp:/bin/cp" \
+    "userspace/bin/mv:/bin/mv" \
+    "userspace/bin/mount:/bin/mount" \
+    "userspace/bin/rescan:/bin/rescan" \
+    "userspace/bin/date:/bin/date" \
+    "userspace/bin/poweroff:/bin/poweroff" \
+    "userspace/bin/reboot:/bin/reboot" \
+    "userspace/bin/shutdown:/bin/shutdown"; then
     BIN_INSTALL_FAILURES="$INSTALL_PROGRAM_FAILURES"
     echo "[!] $BIN_INSTALL_FAILURES /bin userspace install(s) failed; trying legacy root-level fallback." >&2
 
@@ -133,11 +177,39 @@ if [ "$DISK_INSTALL_OK" = "1" ]; then
       "userspace/bin/writetest:/writetest" \
       "userspace/bin/preempt_a:/preempt_a" \
       "userspace/bin/preempt_b:/preempt_b" \
-      "userspace/bin/preempttest:/preempttest"; then
+      "userspace/bin/preempttest:/preempttest" \
+      "userspace/bin/argtest:/argtest" \
+      "userspace/bin/termtest:/termtest" \
+      "userspace/bin/alloctest:/alloctest" \
+      "userspace/bin/cwdtest:/cwdtest" \
+      "userspace/bin/libctest:/libctest" \
+      "userspace/bin/edit:/edit" \
+      "userspace/bin/cursestest:/cursestest" \
+      "userspace/bin/echo:/echo" \
+      "userspace/bin/clear:/clear" \
+      "userspace/bin/pwd:/pwd" \
+      "userspace/bin/cat:/cat" \
+      "userspace/bin/ls:/ls" \
+      "userspace/bin/stat:/stat" \
+      "userspace/bin/which:/which" \
+      "userspace/bin/touch:/touch" \
+      "userspace/bin/mkdir:/mkdir" \
+      "userspace/bin/rmdir:/rmdir" \
+      "userspace/bin/rm:/rm" \
+      "userspace/bin/cp:/cp" \
+      "userspace/bin/mv:/mv" \
+      "userspace/bin/mount:/mount" \
+      "userspace/bin/rescan:/rescan" \
+      "userspace/bin/date:/date" \
+      "userspace/bin/poweroff:/poweroff" \
+      "userspace/bin/reboot:/reboot" \
+      "userspace/bin/shutdown:/shutdown"; then
       LEGACY_INSTALL_FAILURES="$INSTALL_PROGRAM_FAILURES"
       echo "[!] $LEGACY_INSTALL_FAILURES legacy userspace install(s) failed; continuing to boot for recovery." >&2
     fi
   fi
+
+  install_optional_program "userspace/bin/nano" "/bin/nano"
 else
   echo "[*] Skipping userspace program install into $DISK_IMAGE"
 fi

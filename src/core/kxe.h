@@ -16,6 +16,10 @@
 #define KXE_USER_STACK_PAGES    16u
 #define KXE_USER_MIN_VADDR      0x0000000000001000ull
 #define KXE_USER_MAX_VADDR      0x0000800000000000ull
+#define KXE_MAX_ARGC            32u
+#define KXE_ARG_MAX             128u
+#define KXE_MAX_ENVC            8u
+#define KXE_ENV_MAX             128u
 
 enum {
     KXE_FLAG_NONE = 0u,
@@ -70,5 +74,6 @@ _Static_assert(sizeof(kxe_section_t) == KXE_SECTION_SIZE, "kxe_section_t size mu
 
 bool kxe_validate(const uint8_t* header_page, uint64_t actual_file_size, kxe_image_t* out_image);
 process_t* kxe_load(const char* path);
+process_t* kxe_load_argv(const char* path, uint64_t argc, const char* const argv[]);
 
 #endif // CORE_KXE_H
